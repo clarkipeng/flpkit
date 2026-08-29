@@ -1,0 +1,40 @@
+[project]
+name = "flpkit"
+version = "0.1.0"
+description = "Read and write FL Studio .flp project files - a small, dependency-free library for the undocumented FLP format, with self-verifying raw-surgery writers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Origami Research" }]
+keywords = ["fl-studio", "flp", "daw", "midi", "music"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.urls]
+Homepage = "https://github.com/clarkipeng/flpkit"
+Issues = "https://github.com/clarkipeng/flpkit/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flpkit"]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "BLE", "TRY", "SIM", "PTH", "TID", "RUF"]
+ignore = ["TRY003", "E501"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
