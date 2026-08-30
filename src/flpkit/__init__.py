@@ -532,7 +532,12 @@ def write_playlist(
             PLAYLIST_TRACK_SPACE - clip.track,
             0,  # group
         )
-        struct.pack_into("<ff", record, 24, 0.0, 0.0)  # uncut clip offsets
+        # Bytes 24-31 are the clip's cut window in TICKS (u32 start, u32
+        # end) - NOT the f32 offsets pyflp documents. Proven live: FL 2026
+        # derives the visible clip length from this window (a zeroed window
+        # collapsed the clip to length 1 and FL rewrote the head length field
+        # to match on its next save). An uncut clip spans 0..length.
+        struct.pack_into("<II", record, 24, 0, max(1, round(clip.length * ppq)))
         records.append(bytes(record))
     records.sort(key=lambda r: struct.unpack_from("<I", r, 0)[0])
 
