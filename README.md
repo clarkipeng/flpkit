@@ -38,7 +38,7 @@ Every writer then **verifies itself**: it re-reads the saved file and field-matc
 - `set_tempo` - patches the tempo event in place, or appends one when the file omits it (FL expresses default tempo by omission; end-of-stream append is the placement real FL accepts)
 - `write_notes` - splices a pattern's notes blob; `mode="replace"` is scoped to the target channel (a pattern's blob holds *every* channel's notes - naive replacement destroys other channels' work)
 - `set_channel_levels` - patches pan/volume/pitch int32s inside the channel's `Levels` event; refuses legacy files rather than writing guessed units
-- `write_playlist` - splices pattern clips into an arrangement's playlist event; every new record is built from the first EXISTING record as a byte template (so the era-specific tail carries FL's own defaults), kept position-sorted the way FL writes them. Offline-verified against FL-2026 files; the live FL acceptance run is pending
+- `write_playlist` - splices pattern clips into an arrangement's playlist event; every new record is built from the first EXISTING record as a byte template (so the era-specific tail carries FL's own defaults), kept position-sorted the way FL writes them. Live-verified: FL Studio 2026 loads the written clips (song length grows to match) and its OWN re-save round-trips them byte-identically
 
 ## How it was verified
 
@@ -53,7 +53,7 @@ One example of why the live half matters: a note-record flags field of `0` parse
 ## Scope, honestly
 
 flpkit models what a composition agent needs: tempo, channels, levels, notes.
-It does not (yet) decode plugin state or the mixer graph - those events pass through writes untouched, but `read()` does not expose them. Playlist reading landed in 0.2.0, automation-clip reading in 0.3.0, playlist writing in 0.4.0 (live FL acceptance pending); automation writing has not.
+It does not (yet) decode plugin state or the mixer graph - those events pass through writes untouched, but `read()` does not expose them. Playlist reading landed in 0.2.0, automation-clip reading in 0.3.0, playlist writing in 0.4.0 (FL-2026 live-verified); automation writing has not.
 
 ## Bring your own note type
 
