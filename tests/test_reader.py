@@ -365,3 +365,76 @@ def test_event_172_is_one_byte(tmp_path):
     project = flp.read(path)
     assert project.tempo == 130.0  # under the 4-byte bug this event vanished
     assert len(project.channels) == 1
+
+
+def playlist_record(
+    stride: int,
+    *,
+    position: int,
+    item_index: int,
+    length: int,
+    track: int,
+    group: int = 0,
+) -> bytes:
+    """One playlist-item record: the 16-byte decoded head, zero-padded to
+    the stride (the tail bytes are era-specific and ignored by the reader)."""
+    head = struct.pack(
+        "<IHHIHH", position, 20480, item_index, length, 500 - track, group
+    )
+    return head + bytes(stride - len(head))
+
+
+@pytest.mark.parametrize("stride", [32, 60, 88])
+def test_playlist_pattern_clips_decode_at_every_known_stride(tmp_path, stride):
+    blob = playlist_record(
+        stride, position=0, item_index=20480 + 1, length=1536, track=1
+    ) + playlist_record(
+        stride, position=1536, item_index=20480 + 4, length=768, track=4, group=2
+    )
+    path = write_flp(tmp_path, VERSION_MODERN + event(flp.EVENT_PLAYLIST, blob))
+    items = flp.read(path).playlist
+    assert [
+        (i.position, i.pattern, i.length, i.track, i.group, i.channel)
+        for i in items
+    ] == [(0, 1, 1536, 1, 0, None), (1536, 4, 768, 4, 2, None)]
+
+
+def test_playlist_channel_clip_has_channel_not_pattern(tmp_path):
+    blob = playlist_record(88, position=96, item_index=3, length=384, track=7)
+    path = write_flp(tmp_path, VERSION_MODERN + event(flp.EVENT_PLAYLIST, blob))
+    (item,) = flp.read(path).playlist
+    assert (item.channel, item.pattern, item.track) == (3, None, 7)
+
+
+def test_playlist_items_carry_their_arrangement_index(tmp_path):
+    clip = playlist_record(88, position=0, item_index=20481, length=96, track=1)
+    events = (
+        VERSION_MODERN
+        + event(flp.EVENT_ARRANGEMENT_NEW, struct.pack("<H", 0))
+        + event(flp.EVENT_PLAYLIST, clip)
+        + event(flp.EVENT_ARRANGEMENT_NEW, struct.pack("<H", 1))
+        + event(flp.EVENT_PLAYLIST, clip + clip)
+    )
+    path = write_flp(tmp_path, events)
+    assert [i.arrangement for i in flp.read(path).playlist] == [0, 1, 1]
+
+
+def test_playlist_empty_blob_yields_no_items(tmp_path):
+    path = write_flp(tmp_path, VERSION_MODERN + event(flp.EVENT_PLAYLIST, b""))
+    assert flp.read(path).playlist == ()
+
+
+def test_playlist_unknown_record_size_skipped_with_warning(tmp_path, caplog):
+    """A blob no known stride divides is evidence of a new FL era - warn and
+    keep the rest of the project honest rather than guessing a stride."""
+    blob = bytes(88 + 1)
+    events = (
+        VERSION_MODERN
+        + event(flp.EVENT_PLAYLIST, blob)
+        + event(flp.EVENT_TEMPO, struct.pack("<I", 140_000))
+    )
+    path = write_flp(tmp_path, events)
+    project = flp.read(path)
+    assert project.playlist == ()
+    assert project.tempo == 140.0
+    assert any("playlist" in r.message for r in caplog.records)

@@ -88,6 +88,23 @@ EVENT_NAME_INTERNAL = 201  # PluginID.InternalName (e.g. the generator name)
 EVENT_NAME_USER = 203  # PluginID.Name (the user-visible rename)
 EVENT_MIXER_FLAGS = 236  # InsertID.Flags; first one means the mixer section began
 EVENT_CUR_GROUP_ID = 146  # ProjectID.CurGroupId; the anchor for a new pattern block
+EVENT_ARRANGEMENT_NEW = 99  # u16 arrangement index; starts an arrangement block
+EVENT_PLAYLIST = 233  # blob of playlist-item records (see PLAYLIST_STRIDES)
+
+# Playlist item records: the 16-byte decoded head is constant across eras -
+# position u32, pattern_base u16 (ALWAYS 20480 - the per-record signature),
+# item_index u16 (pattern iid+20480, else channel iid), length u32,
+# track_rvidx u16 (reversed: track 1 = 499 in the 500-track space), group u16.
+# The RECORD SIZE grows era by era: 32 (classic), 60 (FL 21), 80 (observed in
+# 17 of FL's bundled demos), 88 (FL 2026, decoded exactly against a project
+# whose playlist visibly held 4 clips). Rather than hardcode that list, the
+# stride is DETECTED: the smallest 4-byte-aligned size >= 32 that divides the
+# blob and puts pattern_base == 20480 (and a sane track) at EVERY record head.
+# All 49 corpus files with playlists resolve unambiguously under this rule.
+PLAYLIST_STRIDE_MIN = 32
+PLAYLIST_STRIDE_MAX = 256
+PLAYLIST_TRACK_SPACE = 500  # track number = PLAYLIST_TRACK_SPACE - track_rvidx
+PATTERN_INDEX_BASE = 20480  # item_index >= this means a pattern clip
 
 # 24-byte packed note record inside a PatternID.Notes blob (matches what FL
 # writes; field semantics documented in _pack_note's implementation).
@@ -144,6 +161,19 @@ class FlpChannel:
 
 
 @dataclass(frozen=True)
+class FlpPlaylistItem:
+    """One clip on an arrangement's playlist, in file units (ticks)."""
+
+    position: int  # ticks from song start
+    length: int  # ticks
+    track: int  # 1-based playlist track number
+    pattern: int | None  # set for pattern clips
+    channel: int | None  # set for audio/automation channel clips
+    group: int = 0
+    arrangement: int = 0
+
+
+@dataclass(frozen=True)
 class FlpProject:
     """Decoded read-only view of a project file."""
 
@@ -151,6 +181,7 @@ class FlpProject:
     tempo: float | None  # None = FL's default (the file omits the event)
     channels: tuple[FlpChannel, ...]
     notes: tuple[FlpNote, ...]  # all patterns; filter by pattern via notes_at
+    playlist: tuple[FlpPlaylistItem, ...] = ()  # all arrangements' clips
 
     def notes_in(self, pattern: int, channel: int | None = None) -> list[FlpNote]:
         """Notes in one pattern, optionally one channel."""
@@ -185,6 +216,8 @@ def read(path: Path) -> FlpProject:
     mixer_seen = False
     pattern = 0  # 0 = before any PatternID.New (A9: stock files do this)
     notes: list[FlpNote] = []
+    arrangement = 0
+    playlist: list[FlpPlaylistItem] = []
 
     for event_id, off, size in _events(stream):
         payload = bytes(stream[off : off + size])
@@ -204,6 +237,13 @@ def read(path: Path) -> FlpProject:
             current = None
         elif event_id == EVENT_PATTERN_NEW and size == 2:
             pattern = int.from_bytes(payload, "little")
+        elif event_id == EVENT_ARRANGEMENT_NEW and size == 2:
+            arrangement = int.from_bytes(payload, "little")
+        elif event_id == EVENT_PLAYLIST:
+            try:
+                playlist.extend(_decode_playlist(payload, arrangement))
+            except FlpError as exc:
+                log.warning("%s: skipping playlist event at offset %d: %s", path.name, off, exc)
         elif event_id == EVENT_PATTERN_NOTES:
             if size % NOTE_SIZE:
                 log.warning(
@@ -230,6 +270,7 @@ def read(path: Path) -> FlpProject:
         tempo=tempo,
         channels=tuple(_build_channel(channel_map[iid]) for iid in sorted(channel_map)),
         notes=tuple(notes),
+        playlist=tuple(playlist),
     )
 
 
@@ -593,6 +634,53 @@ def _without_channel(blob: bytes, channel: int) -> bytes:
         if int.from_bytes(record[6:8], "little") != channel:  # rack_channel
             kept += record
     return bytes(kept)
+
+
+def _playlist_stride_fits(blob: bytes, stride: int) -> bool:
+    """True when every stride-aligned record head carries the pattern_base
+    signature (20480) and a track index inside the 500-track space."""
+    for at in range(0, len(blob), stride):
+        (base,) = struct.unpack_from("<H", blob, at + 4)
+        (rvidx,) = struct.unpack_from("<H", blob, at + 12)
+        if base != PATTERN_INDEX_BASE or not 0 <= PLAYLIST_TRACK_SPACE - rvidx <= PLAYLIST_TRACK_SPACE:
+            return False
+    return True
+
+
+def _decode_playlist(blob: bytes, arrangement: int) -> list[FlpPlaylistItem]:
+    """Decode playlist-item records at the detected stride (see the stride
+    notes above). Raises FlpError when no stride fits - surfaced as a
+    per-event warning, never a crash."""
+    if not blob:
+        return []
+    stride = next(
+        (
+            s
+            for s in range(PLAYLIST_STRIDE_MIN, PLAYLIST_STRIDE_MAX + 1, 4)
+            if len(blob) % s == 0 and _playlist_stride_fits(blob, s)
+        ),
+        None,
+    )
+    if stride is None:
+        raise FlpError(f"playlist blob of {len(blob)} bytes fits no record size (new era?)")
+    items = []
+    for at in range(0, len(blob), stride):
+        position, _base, item_index, length, track_rvidx, group = struct.unpack_from(
+            "<IHHIHH", blob, at
+        )
+        is_pattern = item_index >= PATTERN_INDEX_BASE
+        items.append(
+            FlpPlaylistItem(
+                position=position,
+                length=length,
+                track=PLAYLIST_TRACK_SPACE - track_rvidx,
+                pattern=item_index - PATTERN_INDEX_BASE if is_pattern else None,
+                channel=None if is_pattern else item_index,
+                group=group,
+                arrangement=arrangement,
+            )
+        )
+    return items
 
 
 def _decode_notes(blob: bytes) -> list[FlpNote]:
