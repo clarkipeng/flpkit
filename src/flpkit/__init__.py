@@ -78,6 +78,20 @@ EVENT_VERSION = 199  # ascii "major.minor..."; >= 11.5 -> text events are UTF-16
 EVENT_TEMPO_COARSE = 66  # legacy u16 whole BPM (pre-156 files); 156 wins
 EVENT_TEMPO_FINE = 93  # legacy u16 milli-BPM fraction added to coarse
 EVENT_CHANNEL_NEW = 64  # u16 channel IID; starts that channel's event block
+EVENT_CHANNEL_TYPE = 21  # 1 byte; 5 marks an automation channel (corpus: all
+# 1100 automation blobs across 48 FL-authored files sit in type-5 channels)
+EVENT_CHANNEL_AUTOMATION = 234  # the channel's automation points blob
+CHANNEL_TYPE_AUTOMATION = 5
+
+# Automation blob layout (pyflp-verified field map, corpus-verified sizes):
+# 17B header, point count u32 at 17, then 24B points - x_delta f64 (BEATS from
+# the previous point; corpus positions land on clean beat fractions), value
+# f64 (0..1), tension f32, 4B tension-linked tail. After the points FL writes
+# a trailer (112 bytes in 1098 of 1100 corpus blobs, 136 in 2) that reads pass
+# through untouched.
+_AUTOMATION_COUNT_AT = 17
+_AUTOMATION_POINTS_AT = 21
+_AUTOMATION_POINT_SIZE = 24
 EVENT_CHANNEL_LEVELS = 219  # 24B: pan i32, volume u32, pitch i32, filter 12B
 EVENT_VOL_WORD = 72  # legacy per-channel volume (pre-Levels files)
 EVENT_PAN_WORD = 73  # legacy per-channel pan
@@ -150,6 +164,15 @@ class FlpNote:
 
 
 @dataclass(frozen=True)
+class FlpAutomationPoint:
+    """One automation point, relative to the clip start."""
+
+    position: float  # beats from clip start
+    value: float  # normalized 0..1
+    tension: float
+
+
+@dataclass(frozen=True)
 class FlpChannel:
     """One decoded channel: identity plus mix levels in raw file units."""
 
@@ -158,6 +181,12 @@ class FlpChannel:
     volume: int  # 0..LEVEL_MAX, VOLUME_DEFAULT if the file omits it
     pan: int  # 0..LEVEL_MAX, PAN_CENTRE if omitted
     pitch_semitones: int
+    kind: int | None = None  # EVENT_CHANNEL_TYPE byte; None when the file omits it
+    automation: tuple[FlpAutomationPoint, ...] = ()
+
+    @property
+    def is_automation(self) -> bool:
+        return self.kind == CHANNEL_TYPE_AUTOMATION
 
 
 @dataclass(frozen=True)
@@ -211,8 +240,8 @@ def read(path: Path) -> FlpProject:
     # channel open yet opens channel 0. Verified corpus-wide: FLhd nChannels
     # == |{0} union {New payloads}| on all 164 bundled projects.
     n_channels = int.from_bytes(header[2:4], "little")
-    channel_map: dict[int, dict[str, int | str]] = {}
-    current: dict[str, int | str] | None = None
+    channel_map: dict[int, dict[str, int | str | tuple[FlpAutomationPoint, ...]]] = {}
+    current: dict[str, int | str | tuple[FlpAutomationPoint, ...]] | None = None
     mixer_seen = False
     pattern = 0  # 0 = before any PatternID.New (A9: stock files do this)
     notes: list[FlpNote] = []
@@ -741,11 +770,39 @@ _CHANNEL_EVENT_FIELDS = {
 
 def _is_channel_scoped(event_id: int) -> bool:
     """True for events that belong to the currently open rack channel."""
-    return event_id == EVENT_CHANNEL_LEVELS or event_id in _CHANNEL_EVENT_FIELDS
+    return (
+        event_id in (EVENT_CHANNEL_LEVELS, EVENT_CHANNEL_TYPE, EVENT_CHANNEL_AUTOMATION)
+        or event_id in _CHANNEL_EVENT_FIELDS
+    )
+
+
+def _decode_automation(blob: bytes, offset: int) -> tuple[FlpAutomationPoint, ...]:
+    """Decode an automation blob's points (see the layout notes at the
+    constants). A malformed blob decodes to no points, with a warning - the
+    never-crash contract."""
+    if len(blob) < _AUTOMATION_POINTS_AT:
+        log.warning("automation blob of %d bytes is truncated at offset %d", len(blob), offset)
+        return ()
+    (count,) = struct.unpack_from("<I", blob, _AUTOMATION_COUNT_AT)
+    if _AUTOMATION_POINTS_AT + count * _AUTOMATION_POINT_SIZE > len(blob):
+        log.warning(
+            "automation blob claims %d points but holds %d bytes, at offset %d",
+            count, len(blob), offset,
+        )
+        return ()
+    points = []
+    position = 0.0
+    for i in range(count):
+        delta, value, tension = struct.unpack_from(
+            "<ddf", blob, _AUTOMATION_POINTS_AT + i * _AUTOMATION_POINT_SIZE
+        )
+        position += delta
+        points.append(FlpAutomationPoint(position=position, value=value, tension=tension))
+    return tuple(points)
 
 
 def _apply_channel_event(
-    fields: dict[str, int | str],
+    fields: dict[str, int | str | tuple[FlpAutomationPoint, ...]],
     event_id: int,
     payload: bytes,
     unicode_text: bool,
@@ -765,9 +822,13 @@ def _apply_channel_event(
         fields[_CHANNEL_EVENT_FIELDS[event_id]] = _text(payload, unicode_text, offset)
     elif event_id in (EVENT_VOL_WORD, EVENT_PAN_WORD, EVENT_VOL_BYTE, EVENT_PAN_BYTE):
         fields[_CHANNEL_EVENT_FIELDS[event_id]] = int.from_bytes(payload, "little")
+    elif event_id == EVENT_CHANNEL_TYPE and len(payload) == 1:
+        fields["kind"] = payload[0]
+    elif event_id == EVENT_CHANNEL_AUTOMATION:
+        fields["automation"] = _decode_automation(payload, offset)
 
 
-def _build_channel(fields: dict[str, int | str]) -> FlpChannel:
+def _build_channel(fields: dict[str, int | str | tuple[FlpAutomationPoint, ...]]) -> FlpChannel:
     """Resolve a channel's raw fields: Levels wins over the legacy word/byte
     events; report a default only when the file stored nothing at all. Name
     priority mirrors pyflp's display_name: user rename, else legacy name event,
@@ -776,12 +837,16 @@ def _build_channel(fields: dict[str, int | str]) -> FlpChannel:
     name = name or fields.get("name_internal", "")
     volume = fields.get("levels_volume", fields.get("vol_word", fields.get("vol_byte")))
     pan = fields.get("levels_pan", fields.get("pan_word", fields.get("pan_byte")))
+    kind = fields.get("kind")
+    automation = fields.get("automation", ())
     return FlpChannel(
         index=int(fields["index"]),
         name=str(name),
         volume=int(volume) if volume is not None else VOLUME_DEFAULT,
         pan=int(pan) if pan is not None else PAN_CENTRE,
         pitch_semitones=int(fields.get("levels_pitch", 0)),
+        kind=int(kind) if kind is not None else None,
+        automation=automation if isinstance(automation, tuple) else (),
     )
 
 

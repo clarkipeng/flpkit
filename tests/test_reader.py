@@ -438,3 +438,56 @@ def test_playlist_unknown_record_size_skipped_with_warning(tmp_path, caplog):
     assert project.playlist == ()
     assert project.tempo == 140.0
     assert any("playlist" in r.message for r in caplog.records)
+
+
+# --- automation ---------------------------------------------------------------
+
+
+def automation_blob(points: list[tuple[float, float, float]], tail: int = 112) -> bytes:
+    """Encode an automation event payload: 17B header, count, 24B points
+    (x-delta f64 / value f64 / tension f32 / 4B pad), then the era trailer."""
+    body = bytearray(17)
+    body += struct.pack("<I", len(points))
+    for delta, value, tension in points:
+        body += struct.pack("<ddf", delta, value, tension) + bytes(4)
+    return bytes(body) + bytes(tail)
+
+
+def test_automation_points_decode_with_cumulative_position(tmp_path):
+    events = (
+        VERSION_MODERN
+        + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", 0))
+        + event(flp.EVENT_CHANNEL_TYPE, bytes([flp.CHANNEL_TYPE_AUTOMATION]))
+        + event(flp.EVENT_CHANNEL_AUTOMATION, automation_blob(
+            [(0.0, 0.25, 0.0), (1.5, 0.5, 0.0), (14.5, 1.0, -0.4)]
+        ))
+    )
+    path = write_flp(tmp_path, events)
+    (channel,) = flp.read(path).channels
+    assert channel.is_automation
+    assert [(p.position, p.value) for p in channel.automation] == [
+        (0.0, 0.25), (1.5, 0.5), (16.0, 1.0)
+    ]
+    assert channel.automation[2].tension == pytest.approx(-0.4)
+
+
+def test_channel_kind_defaults_to_none_and_is_not_automation(tmp_path):
+    events = VERSION_MODERN + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", 0))
+    (channel,) = flp.read(write_flp(tmp_path, events)).channels
+    assert channel.kind is None
+    assert not channel.is_automation
+    assert channel.automation == ()
+
+
+def test_automation_blob_with_lying_count_decodes_to_nothing(tmp_path, caplog):
+    blob = automation_blob([(0.0, 0.5, 0.0)])[:30]  # count says 1, points cut off
+    events = (
+        VERSION_MODERN
+        + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", 0))
+        + event(flp.EVENT_CHANNEL_AUTOMATION, blob)
+        + event(flp.EVENT_TEMPO, struct.pack("<I", 125_000))
+    )
+    project = flp.read(write_flp(tmp_path, events))
+    assert project.channels[0].automation == ()
+    assert project.tempo == 125.0
+    assert any("automation" in r.message for r in caplog.records)

@@ -5,7 +5,7 @@ Read and write FL Studio `.flp` project files - without FL Studio, without depen
 ```python
 import flpkit
 
-project = flpkit.read(path)          # ppq, tempo, channels (names + levels), notes, playlist
+project = flpkit.read(path)          # ppq, tempo, channels (names + levels + automation), notes, playlist
 flpkit.set_tempo(path, 128.5)        # returns the tempo the SAVED file contains
 flpkit.write_notes(
     path,
@@ -31,6 +31,7 @@ Every writer then **verifies itself**: it re-reads the saved file and field-matc
 - Notes per pattern and channel (the 24-byte packed record), with correct attribution for the implicit channel 0 and pre-pattern note blobs that stock FL files contain
 - UTF-16/Latin-1 text switching keyed off the file's `FLVersion`
 - Playlist items per arrangement (pattern/audio clips: position, length, track, group), with the record stride DETECTED per blob - FL grew the record from 32 to 60 to 80 to 88 bytes across eras, and the constant `pattern_base` signature identifies the true size instead of a hardcoded list
+- Automation clips: each type-5 channel's points (position in beats from clip start, value 0..1, tension), decoded from the delta-encoded f64 records and verified point-identical to pyflp across 1,100 real blobs
 
 ## What it writes
 
@@ -51,7 +52,7 @@ One example of why the live half matters: a note-record flags field of `0` parse
 ## Scope, honestly
 
 flpkit models what a composition agent needs: tempo, channels, levels, notes.
-It does not (yet) decode automation clips, plugin state, or the mixer graph - those events pass through writes untouched, but `read()` does not expose them. Playlist reading landed in 0.2.0; playlist writing has not.
+It does not (yet) decode plugin state or the mixer graph - those events pass through writes untouched, but `read()` does not expose them. Playlist reading landed in 0.2.0 and automation-clip reading in 0.3.0; writers for both have not.
 
 ## Bring your own note type
 
