@@ -309,11 +309,13 @@ def test_set_channel_levels_refuses_legacy_channel_without_219(tmp_path):
 
 @requires_fl
 def test_set_tempo_on_stock_templates_both_paths(tmp_path):
-    # Empty.flp carries a tempo event (patch path); Basic with limiter omits
-    # it (append path) - the same pair the live e2e uses.
+    # Both templates carry a tempo event. Basic with limiter was long believed
+    # to omit it - that was the event-172 walker desync eating the event; the
+    # fixed walker finds and patches it in place (the append path is covered by
+    # the synthetic no-tempo test above).
     cases = [
         ("Templates/Minimal/Empty/Empty.flp", "patch"),
-        ("Templates/Minimal/Basic with limiter/Basic with limiter.flp", "append"),
+        ("Templates/Minimal/Basic with limiter/Basic with limiter.flp", "patch"),
     ]
     for rel, label in cases:
         path = tmp_path / f"{label}.flp"

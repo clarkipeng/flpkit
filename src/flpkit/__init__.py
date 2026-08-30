@@ -521,9 +521,20 @@ def _chunks(data: bytes) -> tuple[bytes, memoryview]:
     return header, memoryview(data)[start : start + dt_len]
 
 
+# Events whose size breaks the classic range rule. 172 is a ONE-byte event:
+# verified by full-stream consistency on 16 FL-2026-authored files (every one
+# consumes exactly, with ChannelID.New counts matching the FLhd header) and on
+# the two shipped templates that contain it - under the classic 4-byte read,
+# "Basic with limiter" loses a channel AND its tempo event to the desync.
+# pyflp shares the 4-byte bug (it cannot parse fresh FL 2026 saves at all),
+# so this table is where flpkit deliberately diverges from the oracle.
+_EVENT_SIZE_OVERRIDES = {172: 1}
+
+
 def _events(stream: memoryview) -> Iterator[tuple[int, int, int]]:
     """Yield (event_id, payload_offset, payload_size). Encoding: id < 64 ->
-    1 data byte, 64-127 -> 2, 128-191 -> 4, 192+ -> varint length + payload.
+    1 data byte, 64-127 -> 2, 128-191 -> 4, 192+ -> varint length + payload,
+    except the measured overrides in _EVENT_SIZE_OVERRIDES.
 
     Offsets are relative to the event stream (add the FLdt payload's file
     offset for an absolute position). Raises FlpError on truncation.
@@ -534,7 +545,9 @@ def _events(stream: memoryview) -> Iterator[tuple[int, int, int]]:
         head = pos
         event_id = stream[pos]
         pos += 1
-        if event_id < 192:
+        if event_id in _EVENT_SIZE_OVERRIDES:
+            size = _EVENT_SIZE_OVERRIDES[event_id]
+        elif event_id < 192:
             size = 1 if event_id < 64 else 2 if event_id < 128 else 4
         else:
             size = 0

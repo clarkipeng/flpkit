@@ -348,3 +348,20 @@ def test_malformed_version_event_raises(tmp_path):
     path = write_flp(tmp_path, event(flp.EVENT_VERSION, b"not.a.version\0"))
     with pytest.raises(FlpError, match="FLVersion"):
         flp.read(path)
+
+
+def test_event_172_is_one_byte(tmp_path):
+    """FL writes event 172 with a single data byte; the classic range rule
+    (128-191 -> 4 bytes) desyncs the walker and eats whatever follows -
+    measured on FL 2026 saves and two shipped templates, where the 4-byte
+    reading lost a channel and the tempo event."""
+    events = (
+        VERSION_MODERN
+        + bytes([172, 0x01])  # the 1-byte event
+        + event(flp.EVENT_TEMPO, struct.pack("<I", 130_000))
+        + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", 0))
+    )
+    path = write_flp(tmp_path, events)
+    project = flp.read(path)
+    assert project.tempo == 130.0  # under the 4-byte bug this event vanished
+    assert len(project.channels) == 1
