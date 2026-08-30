@@ -349,3 +349,95 @@ def test_replace_is_scoped_to_the_channel_not_the_whole_pattern(tmp_path):
     assert [n.key for n in flp.notes_at(project, 1, 0)] == [79]
     # The other channel is untouched: replace scopes to its own channel.
     assert sorted(n.key for n in flp.notes_at(project, 1, 3)) == [60, 64]
+
+
+# --- write_playlist -----------------------------------------------------------
+
+from test_reader import playlist_record  # noqa: E402
+
+
+def playlist_file(tmp_path, records: bytes, ppq: int = 96) -> Path:
+    events = VERSION_MODERN + event(flp.EVENT_PLAYLIST, records)
+    return write_flp(tmp_path, events, ppq=ppq)
+
+
+def test_write_playlist_merges_and_keeps_position_sort(tmp_path):
+    path = playlist_file(
+        tmp_path,
+        playlist_record(88, position=1536, item_index=20482, length=1536, track=2),
+    )
+    result = flp.write_playlist(
+        path,
+        [flp.ClipSpec(pattern=1, track=1, start=0.0, length=16.0)],
+        mode="merge",
+    )
+    assert [(i.position, i.pattern, i.track) for i in result] == [
+        (0, 1, 1), (1536, 2, 2)
+    ]
+    # the saved bytes are position-sorted, matching how FL itself writes
+    reread = flp.read(path).playlist
+    assert [i.position for i in reread] == sorted(i.position for i in reread)
+
+
+def test_write_playlist_replace_scopes_to_the_arrangement(tmp_path):
+    path = playlist_file(
+        tmp_path,
+        playlist_record(88, position=0, item_index=20481, length=96, track=1)
+        + playlist_record(88, position=96, item_index=20482, length=96, track=2),
+    )
+    result = flp.write_playlist(
+        path,
+        [flp.ClipSpec(pattern=7, track=3, start=4.0, length=8.0)],
+        mode="replace",
+    )
+    assert [(i.pattern, i.track, i.position, i.length) for i in result] == [(7, 3, 384, 768)]
+
+
+def test_write_playlist_new_record_inherits_the_template_tail(tmp_path):
+    template = bytearray(
+        playlist_record(88, position=0, item_index=20481, length=96, track=1)
+    )
+    template[32:88] = bytes(range(56))  # a distinctive era tail
+    path = playlist_file(tmp_path, bytes(template))
+    flp.write_playlist(path, [flp.ClipSpec(pattern=2, track=2, start=2.0, length=1.0)])
+    data = path.read_bytes()
+    blob_at = data.find(bytes(range(56)))
+    assert blob_at != -1
+    assert data.find(bytes(range(56)), blob_at + 1) != -1, "new record lost the tail"
+
+
+def test_write_playlist_refuses_without_a_template(tmp_path):
+    path = write_flp(tmp_path, VERSION_MODERN)
+    with pytest.raises(flp.FlpError, match="template"):
+        flp.write_playlist(path, [flp.ClipSpec(pattern=1, track=1, start=0.0, length=1.0)])
+
+
+def test_write_playlist_targets_the_requested_arrangement(tmp_path):
+    clip0 = playlist_record(88, position=0, item_index=20481, length=96, track=1)
+    clip1 = playlist_record(88, position=0, item_index=20482, length=96, track=1)
+    events = (
+        VERSION_MODERN
+        + event(flp.EVENT_ARRANGEMENT_NEW, struct.pack("<H", 0))
+        + event(flp.EVENT_PLAYLIST, clip0)
+        + event(flp.EVENT_ARRANGEMENT_NEW, struct.pack("<H", 1))
+        + event(flp.EVENT_PLAYLIST, clip1)
+    )
+    path = write_flp(tmp_path, events)
+    flp.write_playlist(
+        path,
+        [flp.ClipSpec(pattern=9, track=5, start=1.0, length=1.0)],
+        arrangement=1,
+    )
+    project = flp.read(path)
+    assert [i.pattern for i in project.playlist if i.arrangement == 0] == [1]
+    assert sorted(
+        i.pattern for i in project.playlist if i.arrangement == 1
+    ) == [2, 9]
+
+
+def test_write_playlist_rejects_track_out_of_space(tmp_path):
+    path = playlist_file(
+        tmp_path, playlist_record(88, position=0, item_index=20481, length=96, track=1)
+    )
+    with pytest.raises(ValueError, match="track"):
+        flp.write_playlist(path, [flp.ClipSpec(pattern=1, track=0, start=0.0, length=1.0)])

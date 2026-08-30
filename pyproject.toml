@@ -1,6 +1,6 @@
 [project]
 name = "flpkit"
-version = "0.3.0"
+version = "0.4.0"
 description = "Read and write FL Studio .flp project files - a small, dependency-free library for the undocumented FLP format, with self-verifying raw-surgery writers"
 readme = "README.md"
 license = "MIT"

@@ -56,6 +56,26 @@ class NoteSpec:
     pan: float = 0.5
 
 
+class ClipLike(Protocol):
+    """What write_playlist needs from a clip object, in tool units: a pattern
+    number placed on a 1-based playlist track, ``start``/``length`` in beats."""
+
+    pattern: int
+    track: int
+    start: float
+    length: float
+
+
+@dataclass(frozen=True)
+class ClipSpec:
+    """A ready-made ClipLike for callers without their own clip model."""
+
+    pattern: int
+    track: int
+    start: float
+    length: float
+
+
 @dataclass(frozen=True)
 class ChannelLevels:
     """A channel's mix state in tool units - the readback of set_channel_levels."""
@@ -364,14 +384,7 @@ def write_notes(
             kept = _without_channel(kept, channel)
         blob = kept + blob
 
-    length = bytearray()
-    n = len(blob)
-    while True:  # varint length, 7 bits per byte, high bit = continue
-        length.append((n & 0x7F) | (0x80 if n > 0x7F else 0))
-        n >>= 7
-        if not n:
-            break
-    notes_event = bytes([EVENT_PATTERN_NOTES]) + bytes(length) + blob
+    notes_event = _frame_event(EVENT_PATTERN_NOTES, blob)
 
     if existing is not None:
         head, off, size = existing
@@ -427,6 +440,134 @@ def write_notes(
         raise FlpError(
             f"readback of {path.name} pattern {pattern} channel {channel} has "
             f"{len(pool)} notes beyond the replace set, e.g. {pool[0]}"
+        )
+    return result
+
+
+
+
+def _frame_event(event_id: int, blob: bytes) -> bytes:
+    """Frame a variable-size event: id byte, varint length (7 bits per byte,
+    high bit = continue), payload."""
+    length = bytearray()
+    n = len(blob)
+    while True:
+        length.append((n & 0x7F) | (0x80 if n > 0x7F else 0))
+        n >>= 7
+        if not n:
+            break
+    return bytes([event_id]) + bytes(length) + blob
+
+
+def write_playlist(
+    path: Path,
+    clips: Sequence[ClipLike],
+    *,
+    mode: NoteWriteMode = "merge",
+    arrangement: int = 0,
+) -> list[FlpPlaylistItem]:
+    """Splice pattern clips into the arrangement's playlist event (raw
+    surgery); return the arrangement's decoded playlist AFTER the write.
+
+    Every record is built from a byte TEMPLATE: the first existing record in
+    the target blob, so the era-specific tail (56 opaque bytes on FL 2026)
+    carries FL's own defaults rather than guesses. A playlist with no existing
+    record has no honest template, so that case raises FlpError instead of
+    inventing tail bytes FL never wrote. Records stay position-sorted - all 54
+    corpus arrangements are stored that way.
+
+    ``mode="replace"`` replaces the WHOLE arrangement playlist with ``clips``;
+    ``"merge"`` adds to it. Raises FlpError when the readback does not contain
+    every sent clip (tick-quantized).
+    """
+    data = bytearray(path.read_bytes())
+    header, stream = _chunks(bytes(data))
+    base = 8 + len(header) + 8  # FLdt payload's file offset
+    ppq = int.from_bytes(header[4:6], "little")
+
+    current_arr = 0
+    existing: tuple[int, int, int] | None = None  # (event head, payload off, size)
+    prev_end = 0
+    for event_id, off, size in _events(stream):
+        head = prev_end
+        prev_end = off + size
+        if event_id == EVENT_ARRANGEMENT_NEW and size == 2:
+            current_arr = int.from_bytes(stream[off : off + size], "little")
+        elif event_id == EVENT_PLAYLIST and current_arr == arrangement and existing is None:
+            existing = (head, off, size)
+    if existing is None:
+        raise FlpError(
+            f"{path.name} has no playlist event for arrangement {arrangement}; "
+            "write_playlist needs one existing clip as a byte template"
+        )
+
+    head, off, size = existing
+    blob = bytes(stream[off : off + size])
+    stride = next(
+        (
+            s
+            for s in range(PLAYLIST_STRIDE_MIN, PLAYLIST_STRIDE_MAX + 1, 4)
+            if len(blob) % s == 0 and _playlist_stride_fits(blob, s)
+        ),
+        None,
+    )
+    if stride is None or not blob:
+        raise FlpError(
+            f"{path.name} arrangement {arrangement}: playlist blob of "
+            f"{len(blob)} bytes fits no known record size; no honest template"
+        )
+    template = blob[:stride]
+
+    records = [] if mode == "replace" else [blob[at : at + stride] for at in range(0, len(blob), stride)]
+    for clip in clips:
+        if not 1 <= clip.track <= PLAYLIST_TRACK_SPACE:
+            raise ValueError(f"track {clip.track} outside 1..{PLAYLIST_TRACK_SPACE}")
+        record = bytearray(template)
+        struct.pack_into(
+            "<IHHIHH", record, 0,
+            round(clip.start * ppq),
+            PATTERN_INDEX_BASE,
+            PATTERN_INDEX_BASE + clip.pattern,
+            max(1, round(clip.length * ppq)),
+            PLAYLIST_TRACK_SPACE - clip.track,
+            0,  # group
+        )
+        struct.pack_into("<ff", record, 24, 0.0, 0.0)  # uncut clip offsets
+        records.append(bytes(record))
+    records.sort(key=lambda r: struct.unpack_from("<I", r, 0)[0])
+
+    event = _frame_event(EVENT_PLAYLIST, b"".join(records))
+    old_extent = (off + size) - head
+    data[base + head : base + off + size] = event
+    dt_len_off = 8 + len(header) + 4
+    old_len = int.from_bytes(data[dt_len_off : dt_len_off + 4], "little")
+    data[dt_len_off : dt_len_off + 4] = (old_len + len(event) - old_extent).to_bytes(4, "little")
+    path.write_bytes(bytes(data))
+
+    # The readback IS the contract: every sent clip must be in the saved file.
+    result = [i for i in read(path).playlist if i.arrangement == arrangement]
+    pool = list(result)
+    for clip in clips:
+        want = (
+            round(clip.start * ppq),
+            max(1, round(clip.length * ppq)),
+            clip.track,
+            clip.pattern,
+        )
+        got = next(
+            (i for i in pool if (i.position, i.length, i.track, i.pattern) == want),
+            None,
+        )
+        if got is None:
+            raise FlpError(
+                f"readback of {path.name} arrangement {arrangement} is missing "
+                f"a sent clip: pattern {clip.pattern} at {clip.start} on track {clip.track}"
+            )
+        pool.remove(got)
+    if mode == "replace" and pool:
+        raise FlpError(
+            f"readback of {path.name} arrangement {arrangement} has "
+            f"{len(pool)} clips beyond the replace set"
         )
     return result
 
