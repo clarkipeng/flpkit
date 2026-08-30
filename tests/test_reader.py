@@ -47,9 +47,10 @@ def note_record(
     channel: int = 0,
     velocity: int = 100,
     pan: int = 64,
+    flags: int = 0,
 ) -> bytes:
     return flp.NOTE_STRUCT.pack(
-        position, 0, channel, length, key, 0,
+        position, flags, channel, length, key, 0,
         flp.FINE_PITCH_CENTER, 0, flp.RELEASE_DEFAULT, 0,
         pan, velocity, flp.MOD_DEFAULT, flp.MOD_DEFAULT,
     )
@@ -376,12 +377,16 @@ def playlist_record(
     track: int,
     group: int = 0,
 ) -> bytes:
-    """One playlist-item record: the 16-byte decoded head, zero-padded to
-    the stride (the tail bytes are era-specific and ignored by the reader)."""
+    """One playlist-item record: the 16-byte decoded head, the uncut cut
+    window (0..length ticks) FL writes at bytes 24-31, zero-padded to the
+    stride (the remaining tail bytes are era-specific and ignored)."""
     head = struct.pack(
         "<IHHIHH", position, 20480, item_index, length, 500 - track, group
     )
-    return head + bytes(stride - len(head))
+    record = bytearray(stride)
+    record[: len(head)] = head
+    struct.pack_into("<II", record, 24, 0, length)
+    return bytes(record)
 
 
 @pytest.mark.parametrize("stride", [32, 60, 88])
@@ -443,13 +448,19 @@ def test_playlist_unknown_record_size_skipped_with_warning(tmp_path, caplog):
 # --- automation ---------------------------------------------------------------
 
 
-def automation_blob(points: list[tuple[float, float, float]], tail: int = 112) -> bytes:
+def automation_blob(
+    points: list[tuple[float, float, float]],
+    tail: int = 112,
+    point_tails: list[bytes] | None = None,
+) -> bytes:
     """Encode an automation event payload: 17B header, count, 24B points
-    (x-delta f64 / value f64 / tension f32 / 4B pad), then the era trailer."""
+    (x-delta f64 / value f64 / tension f32 / 4B per-point tail), then the era
+    trailer."""
     body = bytearray(17)
     body += struct.pack("<I", len(points))
-    for delta, value, tension in points:
-        body += struct.pack("<ddf", delta, value, tension) + bytes(4)
+    for i, (delta, value, tension) in enumerate(points):
+        body += struct.pack("<ddf", delta, value, tension)
+        body += point_tails[i] if point_tails else bytes(4)
     return bytes(body) + bytes(tail)
 
 
@@ -469,6 +480,23 @@ def test_automation_points_decode_with_cumulative_position(tmp_path):
         (0.0, 0.25), (1.5, 0.5), (16.0, 1.0)
     ]
     assert channel.automation[2].tension == pytest.approx(-0.4)
+
+
+def test_automation_points_carry_their_raw_tails(tmp_path):
+    # FL's opaque 4-byte per-point tail varies per point (corpus: only 4 of
+    # 1,100 blobs have uniform tails), so the decode keeps each one raw for
+    # byte-faithful rewrites.
+    tails = [b"\x00\x00\x00\x00", b"\x00\x00\x00\xff", b"\x00\x00\x00\x02"]
+    events = (
+        VERSION_MODERN
+        + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", 0))
+        + event(flp.EVENT_CHANNEL_TYPE, bytes([flp.CHANNEL_TYPE_AUTOMATION]))
+        + event(flp.EVENT_CHANNEL_AUTOMATION, automation_blob(
+            [(0.0, 0.0, 0.0), (1.0, 0.5, 0.0), (1.0, 1.0, 0.0)], point_tails=tails
+        ))
+    )
+    (channel,) = flp.read(write_flp(tmp_path, events)).channels
+    assert [p.tail for p in channel.automation] == tails
 
 
 def test_channel_kind_defaults_to_none_and_is_not_automation(tmp_path):
