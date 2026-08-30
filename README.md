@@ -39,6 +39,18 @@ Every writer then **verifies itself**: it re-reads the saved file and field-matc
 - `write_notes` - splices a pattern's notes blob; `mode="replace"` is scoped to the target channel (a pattern's blob holds *every* channel's notes - naive replacement destroys other channels' work)
 - `set_channel_levels` - patches pan/volume/pitch int32s inside the channel's `Levels` event; refuses legacy files rather than writing guessed units
 - `write_playlist` - splices pattern clips into an arrangement's playlist event; every new record is built from the first EXISTING record as a byte template (so the era-specific tail carries FL's own defaults), kept position-sorted the way FL writes them. Live-verified: FL Studio 2026 loads the written clips (song length grows to match) and its OWN re-save round-trips them byte-identically
+- `write_automation` - replaces the points inside an EXISTING automation channel's blob; the 17-byte header and the opaque era trailer are carried verbatim, absolute positions convert back to FL's stored x-deltas, and each point's opaque 4-byte tail rides along.
+  Feeding a channel's decoded points straight back rewrites its blob byte-identically (verified across all 1,100 corpus blobs).
+  Creating a NEW clip is out of scope until the link bytes are decoded - a non-automation channel or a missing blob is an error, not an invitation to fabricate
+
+## Detect, don't assume
+
+Format constants are DETECTED from the file itself wherever the data carries an invariant, with hardcoded values only as logged fallbacks:
+
+- The playlist record stride is detected per blob (the constant `pattern_base` signature), never taken from a version table.
+- The note-flags word is templated from the target file's own notes; the corpus-surveyed `0x4000` covers files with none.
+- The playlist cut window (bytes 24-31) is only written when every existing record in the file exhibits the verified `0..length` relation; otherwise the write refuses.
+- Event-size overrides (event 172 is one byte on FL 2026, not the classic four) are an `event_size_overrides` argument on every public function, so a capability profile can supply a measured table for other FL versions; the built-in FL-2026 table is the once-logged fallback.
 
 ## How it was verified
 
@@ -53,7 +65,8 @@ One example of why the live half matters: a note-record flags field of `0` parse
 ## Scope, honestly
 
 flpkit models what a composition agent needs: tempo, channels, levels, notes.
-It does not (yet) decode plugin state or the mixer graph - those events pass through writes untouched, but `read()` does not expose them. Playlist reading landed in 0.2.0, automation-clip reading in 0.3.0, playlist writing in 0.4.0 (FL-2026 live-verified); automation writing has not.
+It does not (yet) decode plugin state or the mixer graph - those events pass through writes untouched, but `read()` does not expose them. Playlist reading landed in 0.2.0, automation-clip reading in 0.3.0, playlist writing in 0.4.0 (FL-2026 live-verified), automation-point writing in 0.5.0 (corpus-verified byte-identical; live FL round-trip pending).
+Automation clip CREATION (a new curve on a new target) stays out until the target-link bytes are decoded by live minimal-pair experiments.
 
 ## Bring your own note type
 

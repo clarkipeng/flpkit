@@ -3,7 +3,8 @@
 flpkit is a small, dependency-free library for the undocumented FLP format:
 
 - **Reading**: ppq, tempo (modern and legacy events), channels (names + mix
-  levels across four format generations), and notes per pattern/channel.
+  levels across four format generations), notes per pattern/channel, playlist
+  clips per arrangement, and automation points per type-5 channel.
 - **Writing**: raw byte surgery - patch or append exactly the bytes that
   express the change, never reserialize the whole file. FL Studio rejects
   whole-file reserialization by third-party writers (verified live 2026-08-27:
@@ -20,9 +21,11 @@ project, https://github.com/origami-research/fl-studio-mcp.
 
 from __future__ import annotations
 
+import functools
 import logging
 import struct
-from collections.abc import Iterator, Sequence
+from collections import Counter
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
@@ -76,6 +79,27 @@ class ClipSpec:
     length: float
 
 
+class AutomationPointLike(Protocol):
+    """What write_automation needs from a point object: ``position`` is beats
+    from clip start (absolute; the writer converts back to FL's stored
+    x-deltas), ``value`` is normalized 0..1, ``tension`` -1..1. A point may
+    also carry a 4-byte ``tail`` attribute (FL's opaque per-point tail, see
+    FlpAutomationPoint) - points without one get the plain-point default."""
+
+    position: float
+    value: float
+    tension: float
+
+
+@dataclass(frozen=True)
+class AutomationPointSpec:
+    """A ready-made AutomationPointLike for callers without their own model."""
+
+    position: float
+    value: float
+    tension: float = 0.0
+
+
 @dataclass(frozen=True)
 class ChannelLevels:
     """A channel's mix state in tool units - the readback of set_channel_levels."""
@@ -108,10 +132,18 @@ CHANNEL_TYPE_AUTOMATION = 5
 # the previous point; corpus positions land on clean beat fractions), value
 # f64 (0..1), tension f32, 4B tension-linked tail. After the points FL writes
 # a trailer (112 bytes in 1098 of 1100 corpus blobs, 136 in 2) that reads pass
-# through untouched.
+# through untouched and writes carry verbatim.
 _AUTOMATION_COUNT_AT = 17
 _AUTOMATION_POINTS_AT = 21
 _AUTOMATION_POINT_SIZE = 24
+_AUTOMATION_TAIL_AT = 20  # tail offset inside one 24-byte point record
+# The tail FL writes on a plain point (corpus: 1,093 of 9,676 points carry
+# exactly this, typically a clip's first point; the rest vary per point, which
+# is why decoded points carry their own tail bytes for byte-faithful rewrites).
+AUTOMATION_TAIL_DEFAULT = bytes(4)
+# FL itself stores values a hair outside 0..1 (corpus max 1.0000403), so input
+# validation allows the same slack rather than refusing FL's own data.
+_AUTOMATION_VALUE_SLACK = 0.001
 EVENT_CHANNEL_LEVELS = 219  # 24B: pan i32, volume u32, pitch i32, filter 12B
 EVENT_VOL_WORD = 72  # legacy per-channel volume (pre-Levels files)
 EVENT_PAN_WORD = 73  # legacy per-channel pan
@@ -161,6 +193,8 @@ MOD_DEFAULT = 128
 # Every note FL itself writes carries bit 0x4000. Surveyed across the 132 bundled
 # FL 2026 projects that contain notes: 23,526 records with flags=0x4000 and 909
 # with 0x4008 - and NOT ONE with flags=0, which is what v1 emitted.
+# write_notes templates the flags word from the target file's OWN notes when it
+# has any (detect-don't-assume); this corpus constant is the fallback.
 NOTE_FLAGS_DEFAULT = 0x4000
 
 
@@ -185,11 +219,16 @@ class FlpNote:
 
 @dataclass(frozen=True)
 class FlpAutomationPoint:
-    """One automation point, relative to the clip start."""
+    """One automation point, relative to the clip start.
+
+    ``tail`` is FL's opaque 4-byte per-point tail, carried raw so that feeding
+    a decoded clip back through write_automation rewrites it byte-identically.
+    """
 
     position: float  # beats from clip start
     value: float  # normalized 0..1
     tension: float
+    tail: bytes = AUTOMATION_TAIL_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -244,8 +283,13 @@ class FlpProject:
 # -- public API -----------------------------------------------------------------
 
 
-def read(path: Path) -> FlpProject:
-    """Parse the file. Raises FlpError naming the byte offset on bad input."""
+def read(path: Path, *, event_size_overrides: Mapping[int, int] | None = None) -> FlpProject:
+    """Parse the file. Raises FlpError naming the byte offset on bad input.
+
+    ``event_size_overrides`` maps event ids to their measured payload sizes
+    where FL breaks the classic range rule (a capability profile supplies it;
+    None falls back to the built-in FL-2026 table, logged once per process).
+    """
     data = path.read_bytes()
     header, stream = _chunks(data)
     ppq = int.from_bytes(header[4:6], "little")
@@ -268,7 +312,7 @@ def read(path: Path) -> FlpProject:
     arrangement = 0
     playlist: list[FlpPlaylistItem] = []
 
-    for event_id, off, size in _events(stream):
+    for event_id, off, size in _events(stream, event_size_overrides):
         payload = bytes(stream[off : off + size])
         if event_id == EVENT_VERSION:
             unicode_text = _version_is_unicode(payload, off)
@@ -323,9 +367,15 @@ def read(path: Path) -> FlpProject:
     )
 
 
-def notes_at(path: Path, pattern: int, channel: int) -> list[FlpNote]:
+def notes_at(
+    path: Path,
+    pattern: int,
+    channel: int,
+    *,
+    event_size_overrides: Mapping[int, int] | None = None,
+) -> list[FlpNote]:
     """The notes actually in the SAVED file - THE readback for verification."""
-    return read(path).notes_in(pattern, channel)
+    return read(path, event_size_overrides=event_size_overrides).notes_in(pattern, channel)
 
 
 def write_notes(
@@ -335,46 +385,31 @@ def write_notes(
     pattern: int,
     channel: int,
     mode: NoteWriteMode,
+    event_size_overrides: Mapping[int, int] | None = None,
 ) -> list[FlpNote]:
     """Splice the pattern's notes blob (raw surgery); return ``notes_at`` of
     the RESULT. Raises FlpError when the readback does not field-match what was
-    sent (tick-quantized positions; velocity within 1/127)."""
+    sent (tick-quantized positions; velocity within 1/127).
+
+    New notes template their flags word from the file's own existing notes
+    (most common wins); NOTE_FLAGS_DEFAULT is the corpus fallback for a file
+    with no notes yet."""
     data = bytearray(path.read_bytes())
     header, stream = _chunks(bytes(data))
     base = 8 + len(header) + 8  # FLdt payload's file offset
     ppq = int.from_bytes(header[4:6], "little")
-    blob = _encode_notes(notes, channel, ppq)
 
-    # One walk locates everything the splice needs: the end of the target
-    # pattern's PatternID.New event, the extent of that pattern's existing
-    # notes event (only a 224 event while the
-    # target pattern is current counts), and the anchor for a new pattern.
-    current = 0
-    prev_end = 0
-    pattern_end: int | None = None
-    existing: tuple[int, int, int] | None = None  # (event head, payload off, size)
-    anchor_end: int | None = None
-    channel_section_head: int | None = None  # where FL's channel block starts
-    for event_id, off, size in _events(stream):
-        head = prev_end
-        prev_end = off + size
-        if event_id == EVENT_PATTERN_NEW and size == 2:
-            current = int.from_bytes(stream[off : off + size], "little")
-            if current == pattern and pattern_end is None:
-                pattern_end = off + size
-        elif event_id == EVENT_PATTERN_NOTES and current == pattern and existing is None:
-            existing = (head, off, size)
-        elif event_id == EVENT_CUR_GROUP_ID and anchor_end is None:
-            anchor_end = off + size
-        elif (
-            channel_section_head is None
-            and anchor_end is None
-            and (event_id == EVENT_CHANNEL_NEW or _is_channel_scoped(event_id))
-        ):
-            channel_section_head = head
+    sites = _locate_notes_splice(stream, pattern, event_size_overrides)
+    if sites.note_flags is None:
+        log.debug(
+            "%s has no existing notes to template flags from; using the corpus "
+            "default 0x%04x", path.name, NOTE_FLAGS_DEFAULT,
+        )
+    flags = sites.note_flags if sites.note_flags is not None else NOTE_FLAGS_DEFAULT
+    blob = _encode_notes(notes, channel, ppq, flags)
 
-    if existing is not None:
-        head, off, size = existing
+    if sites.existing is not None:
+        _head, off, size = sites.existing
         kept = bytes(stream[off : off + size])
         if mode == "replace":
             # A pattern's Notes blob holds EVERY channel's notes, so replacing
@@ -385,62 +420,130 @@ def write_notes(
         blob = kept + blob
 
     notes_event = _frame_event(EVENT_PATTERN_NOTES, blob)
+    _apply_notes_splice(data, base, len(stream), sites, pattern, notes_event)
+    path.write_bytes(bytes(data))
 
-    if existing is not None:
-        head, off, size = existing
-        old_extent = (off + size) - head
-        data[base + head : base + off + size] = notes_event
-        dt_len_off = 8 + len(header) + 4
-        old_len = int.from_bytes(data[dt_len_off : dt_len_off + 4], "little")
-        new_len = old_len + len(notes_event) - old_extent
-        data[dt_len_off : dt_len_off + 4] = new_len.to_bytes(4, "little")
-    elif pattern_end is not None:
-        _splice(data, base + pattern_end, notes_event)
+    expected = _decode_notes(_encode_notes(notes, channel, ppq, flags))
+    return _verify_notes_readback(path, pattern, channel, expected, mode, event_size_overrides)
+
+
+@dataclass(frozen=True)
+class _NotesSpliceSites:
+    """Everything one locating walk finds for a notes splice: the extent of
+    the target pattern's existing notes event, the end of its PatternID.New
+    event, the anchors a brand-new pattern block would splice at, and the
+    file's own note-flags template."""
+
+    existing: tuple[int, int, int] | None  # (event head, payload off, size)
+    pattern_end: int | None  # end of the target pattern's New event
+    anchor_end: int | None  # end of the display-group anchor event
+    channel_section_head: int | None  # where FL's channel block starts
+    note_flags: int | None  # most common flags word among the file's notes
+
+
+def _locate_notes_splice(
+    stream: memoryview, pattern: int, overrides: Mapping[int, int] | None
+) -> _NotesSpliceSites:
+    """One walk locates everything the splice needs (only a 224 event while
+    the target pattern is current counts as its notes event) and surveys the
+    flags word of every existing note - the file itself is the template for
+    what a note's flags should be (detect-don't-assume)."""
+    current = 0
+    prev_end = 0
+    pattern_end: int | None = None
+    existing: tuple[int, int, int] | None = None
+    anchor_end: int | None = None
+    channel_section_head: int | None = None
+    flags_seen: Counter[int] = Counter()
+    for event_id, off, size in _events(stream, overrides):
+        head = prev_end
+        prev_end = off + size
+        if event_id == EVENT_PATTERN_NEW and size == 2:
+            current = int.from_bytes(stream[off : off + size], "little")
+            if current == pattern and pattern_end is None:
+                pattern_end = off + size
+        elif event_id == EVENT_PATTERN_NOTES:
+            if size % NOTE_SIZE == 0:
+                flags_seen.update(
+                    int.from_bytes(stream[off + at + 4 : off + at + 6], "little")
+                    for at in range(0, size, NOTE_SIZE)
+                )
+            if current == pattern and existing is None:
+                existing = (head, off, size)
+        elif event_id == EVENT_CUR_GROUP_ID and anchor_end is None:
+            anchor_end = off + size
+        elif (
+            channel_section_head is None
+            and anchor_end is None
+            and (event_id == EVENT_CHANNEL_NEW or _is_channel_scoped(event_id))
+        ):
+            channel_section_head = head
+    return _NotesSpliceSites(
+        existing=existing,
+        pattern_end=pattern_end,
+        anchor_end=anchor_end,
+        channel_section_head=channel_section_head,
+        note_flags=flags_seen.most_common(1)[0][0] if flags_seen else None,
+    )
+
+
+def _apply_notes_splice(
+    data: bytearray,
+    base: int,
+    stream_len: int,
+    sites: _NotesSpliceSites,
+    pattern: int,
+    notes_event: bytes,
+) -> None:
+    """Land the framed notes event at the located site: replace the existing
+    event in place, insert after the pattern's New event, or create the
+    pattern block where FL itself writes them."""
+    if sites.existing is not None:
+        head, off, size = sites.existing
+        _replace_event(data, base, head, off, size, notes_event)
+    elif sites.pattern_end is not None:
+        _splice(data, base + sites.pattern_end, notes_event)
     else:
         # No such pattern yet - create it where FL itself writes patterns,
         # after the display-group block (stream start if absent).
         new_pattern = bytes([EVENT_PATTERN_NEW]) + pattern.to_bytes(2, "little")
         # NOT stream offset 0: splicing a pattern block ahead of the FLVersion
-        # event yields a file our reader parses and FL refuses to open at all
-        #. FL writes the pattern block after the project header
-        # and immediately before the channel section.
-        if anchor_end is not None:
-            at = base + anchor_end
-        elif channel_section_head is not None:
-            at = base + channel_section_head
+        # event yields a file our reader parses and FL refuses to open at all.
+        # FL writes the pattern block after the project header and immediately
+        # before the channel section.
+        if sites.anchor_end is not None:
+            at = base + sites.anchor_end
+        elif sites.channel_section_head is not None:
+            at = base + sites.channel_section_head
         else:
-            at = base + len(stream)
+            at = base + stream_len
         _splice(data, at, new_pattern + notes_event)
 
-    path.write_bytes(bytes(data))
 
-    # The readback IS the contract: every sent note must be found in the saved
-    # file, field-matched after the same tool-unit -> file-unit quantization.
-    result = notes_at(path, pattern, channel)
-    expected = _decode_notes(_encode_notes(notes, channel, ppq))
-    pool = list(result)
-    for want in expected:
-        found = next(
-            (
-                got
-                for got in pool
-                if (got.position, got.length, got.key, got.channel, got.pan)
-                == (want.position, want.length, want.key, want.channel, want.pan)
-                and abs(got.velocity - want.velocity) <= 1
-            ),
-            None,
-        )
-        if found is None:
-            raise FlpError(
-                f"readback of {path.name} pattern {pattern} channel {channel} "
-                f"is missing a sent note: {want}"
-            )
-        pool.remove(found)
-    if mode == "replace" and pool:
-        raise FlpError(
-            f"readback of {path.name} pattern {pattern} channel {channel} has "
-            f"{len(pool)} notes beyond the replace set, e.g. {pool[0]}"
-        )
+def _verify_notes_readback(
+    path: Path,
+    pattern: int,
+    channel: int,
+    expected: Sequence[FlpNote],
+    mode: NoteWriteMode,
+    overrides: Mapping[int, int] | None,
+) -> list[FlpNote]:
+    """The readback IS the contract: every sent note must be found in the
+    saved file, field-matched after the same tool-unit -> file-unit
+    quantization."""
+    result = notes_at(path, pattern, channel, event_size_overrides=overrides)
+
+    def matches(want: FlpNote, got: FlpNote) -> bool:
+        return (got.position, got.length, got.key, got.channel, got.pan) == (
+            want.position, want.length, want.key, want.channel, want.pan,
+        ) and abs(got.velocity - want.velocity) <= 1
+
+    _verify_readback(
+        result, expected, matches,
+        mode=mode,
+        context=f"{path.name} pattern {pattern} channel {channel}",
+        noun="note",
+    )
     return result
 
 
@@ -465,6 +568,7 @@ def write_playlist(
     *,
     mode: NoteWriteMode = "merge",
     arrangement: int = 0,
+    event_size_overrides: Mapping[int, int] | None = None,
 ) -> list[FlpPlaylistItem]:
     """Splice pattern clips into the arrangement's playlist event (raw
     surgery); return the arrangement's decoded playlist AFTER the write.
@@ -488,7 +592,7 @@ def write_playlist(
     current_arr = 0
     existing: tuple[int, int, int] | None = None  # (event head, payload off, size)
     prev_end = 0
-    for event_id, off, size in _events(stream):
+    for event_id, off, size in _events(stream, event_size_overrides):
         head = prev_end
         prev_end = off + size
         if event_id == EVENT_ARRANGEMENT_NEW and size == 2:
@@ -518,6 +622,25 @@ def write_playlist(
         )
     template = blob[:stride]
 
+    # Bytes 24-31 are the clip's cut window in TICKS (u32 start, u32 end) -
+    # NOT the f32 offsets pyflp documents. Proven live: FL 2026 derives the
+    # visible clip length from this window (a zeroed window collapsed the clip
+    # to length 1 and FL rewrote the head length field to match on its next
+    # save). An uncut clip spans 0..length. That layout is only trusted where
+    # the file ITSELF exhibits it: every existing record must span its full
+    # length, or the write refuses - a record that does not is a genuinely cut
+    # clip, or an earlier era whose bytes 24-31 mean something unverified.
+    for at in range(0, len(blob), stride):
+        (length,) = struct.unpack_from("<I", blob, at + 8)
+        window = struct.unpack_from("<II", blob, at + 24)
+        if window != (0, length):
+            raise FlpError(
+                f"{path.name} arrangement {arrangement}: record at byte {at} has cut "
+                f"window {window[0]}..{window[1]} for length {length}; refusing to "
+                "write the cut window into a file whose own records do not span "
+                "0..length (unverified layout)"
+            )
+
     records = [] if mode == "replace" else [blob[at : at + stride] for at in range(0, len(blob), stride)]
     for clip in clips:
         if not 1 <= clip.track <= PLAYLIST_TRACK_SPACE:
@@ -532,52 +655,42 @@ def write_playlist(
             PLAYLIST_TRACK_SPACE - clip.track,
             0,  # group
         )
-        # Bytes 24-31 are the clip's cut window in TICKS (u32 start, u32
-        # end) - NOT the f32 offsets pyflp documents. Proven live: FL 2026
-        # derives the visible clip length from this window (a zeroed window
-        # collapsed the clip to length 1 and FL rewrote the head length field
-        # to match on its next save). An uncut clip spans 0..length.
         struct.pack_into("<II", record, 24, 0, max(1, round(clip.length * ppq)))
         records.append(bytes(record))
     records.sort(key=lambda r: struct.unpack_from("<I", r, 0)[0])
 
     event = _frame_event(EVENT_PLAYLIST, b"".join(records))
-    old_extent = (off + size) - head
-    data[base + head : base + off + size] = event
-    dt_len_off = 8 + len(header) + 4
-    old_len = int.from_bytes(data[dt_len_off : dt_len_off + 4], "little")
-    data[dt_len_off : dt_len_off + 4] = (old_len + len(event) - old_extent).to_bytes(4, "little")
+    _replace_event(data, base, head, off, size, event)
     path.write_bytes(bytes(data))
 
     # The readback IS the contract: every sent clip must be in the saved file.
-    result = [i for i in read(path).playlist if i.arrangement == arrangement]
-    pool = list(result)
-    for clip in clips:
-        want = (
-            round(clip.start * ppq),
-            max(1, round(clip.length * ppq)),
-            clip.track,
-            clip.pattern,
+    result = [
+        i
+        for i in read(path, event_size_overrides=event_size_overrides).playlist
+        if i.arrangement == arrangement
+    ]
+
+    def matches(want: ClipLike, got: FlpPlaylistItem) -> bool:
+        return (got.position, got.length, got.track, got.pattern) == (
+            round(want.start * ppq),
+            max(1, round(want.length * ppq)),
+            want.track,
+            want.pattern,
         )
-        got = next(
-            (i for i in pool if (i.position, i.length, i.track, i.pattern) == want),
-            None,
-        )
-        if got is None:
-            raise FlpError(
-                f"readback of {path.name} arrangement {arrangement} is missing "
-                f"a sent clip: pattern {clip.pattern} at {clip.start} on track {clip.track}"
-            )
-        pool.remove(got)
-    if mode == "replace" and pool:
-        raise FlpError(
-            f"readback of {path.name} arrangement {arrangement} has "
-            f"{len(pool)} clips beyond the replace set"
-        )
+
+    _verify_readback(
+        result, clips, matches,
+        mode=mode,
+        context=f"{path.name} arrangement {arrangement}",
+        noun="clip",
+        describe=lambda c: f"pattern {c.pattern} at {c.start} on track {c.track}",
+    )
     return result
 
 
-def set_tempo(path: Path, bpm: float) -> float:
+def set_tempo(
+    path: Path, bpm: float, *, event_size_overrides: Mapping[int, int] | None = None
+) -> float:
     """Patch the tempo event's u32 in place, or APPEND one at the end of the
     event stream when FL omitted it (end-of-stream wins by sequential
     application - live-verified; mid-stream splices load-but-ignore or reject
@@ -591,7 +704,7 @@ def set_tempo(path: Path, bpm: float) -> float:
     payload = round(bpm * 1000).to_bytes(4, "little")
 
     patched = False
-    for event_id, off, size in _events(stream):
+    for event_id, off, size in _events(stream, event_size_overrides):
         if event_id == EVENT_TEMPO and size == 4:
             data[base + off : base + off + 4] = payload
             patched = True
@@ -602,7 +715,7 @@ def set_tempo(path: Path, bpm: float) -> float:
 
     path.write_bytes(bytes(data))
 
-    stored = read(path).tempo
+    stored = read(path, event_size_overrides=event_size_overrides).tempo
     if stored is None or round(stored * 1000) != round(bpm * 1000):
         raise FlpError(f"tempo readback {stored!r} does not match requested {bpm}")
     return stored
@@ -615,6 +728,7 @@ def set_channel_levels(
     volume: float | None = None,
     pan: float | None = None,
     pitch_semitones: int | None = None,
+    event_size_overrides: Mapping[int, int] | None = None,
 ) -> ChannelLevels:
     """Patch the channel's levels in place; None leaves a value alone. Returns
     the readback. Levels are ONE event (ChannelID.Levels, 219) with a fixed
@@ -639,7 +753,7 @@ def set_channel_levels(
     mixer_seen = False
     seen: set[int] = set()
     levels_off: int | None = None
-    for event_id, off, size in _events(stream):
+    for event_id, off, size in _events(stream, event_size_overrides):
         if event_id == EVENT_CHANNEL_NEW and size == 2 and not mixer_seen:
             current = int.from_bytes(stream[off : off + size], "little")
             seen.add(current)
@@ -678,7 +792,11 @@ def set_channel_levels(
     # Report what the saved file contains, then confirm the requested fields
     # landed exactly (the write is deterministic byte surgery; any drift is a
     # writer bug, not tolerance).
-    saved = next(c for c in read(path).channels if c.index == channel)
+    saved = next(
+        c
+        for c in read(path, event_size_overrides=event_size_overrides).channels
+        if c.index == channel
+    )
     mismatches = [
         name
         for name, requested, stored in (
@@ -698,6 +816,133 @@ def set_channel_levels(
         pan=(saved.pan - PAN_CENTRE) / PAN_CENTRE,
         pitch_semitones=saved.pitch_semitones,
     )
+
+
+def write_automation(
+    path: Path,
+    channel: int,
+    points: Sequence[AutomationPointLike],
+    *,
+    mode: Literal["replace"] = "replace",
+    event_size_overrides: Mapping[int, int] | None = None,
+) -> int:
+    """Replace the points inside an EXISTING automation channel's blob;
+    return the number of points written (patch-and-verify, like
+    set_channel_levels).
+
+    Correct by construction, not by decoding: the 17-byte header and the era
+    trailer are carried verbatim from the channel's own blob, only the count
+    and the point records between them are rebuilt. Absolute ``position``
+    beats convert back to FL's stored x-deltas (points are sorted by position
+    first; FL stores forward deltas - zero deltas, i.e. vertical steps, are
+    fine). A channel that is not kind 5 or has no blob is an error, not an
+    invitation to fabricate: creating a NEW clip needs the live minimal-pair
+    evidence this writer deliberately does not guess at.
+
+    Feeding a channel's decoded points straight back rewrites its blob
+    byte-identically (decoded points carry their opaque per-point tails;
+    verified across all 1,100 corpus blobs)."""
+    if mode != "replace":
+        raise ValueError(f"unsupported mode {mode!r}; write_automation only replaces")
+    ordered = sorted(points, key=lambda p: p.position)
+    for p in ordered:
+        if not -_AUTOMATION_VALUE_SLACK <= p.value <= 1 + _AUTOMATION_VALUE_SLACK:
+            raise ValueError(f"point value {p.value} out of range (normalized 0..1)")
+        if not -1.0 <= p.tension <= 1.0:
+            raise ValueError(f"point tension {p.tension} out of range (-1..1)")
+        tail = getattr(p, "tail", None)
+        if tail is not None and len(tail) != 4:
+            raise ValueError(f"point tail must be 4 bytes, got {len(tail)}")
+    if ordered and ordered[0].position < 0:
+        raise ValueError(f"point position {ordered[0].position} is negative")
+
+    data = bytearray(path.read_bytes())
+    header, stream = _chunks(bytes(data))
+    base = 8 + len(header) + 8  # FLdt payload's file offset
+
+    # Same attribution rule as read(): channel 0 is implicit, New(64) switches,
+    # the mixer section ends attribution.
+    current: int | None = None
+    mixer_seen = False
+    seen: set[int] = set()
+    kind: int | None = None
+    auto_event: tuple[int, int, int] | None = None  # (event head, payload off, size)
+    prev_end = 0
+    for event_id, off, size in _events(stream, event_size_overrides):
+        head = prev_end
+        prev_end = off + size
+        if event_id == EVENT_CHANNEL_NEW and size == 2 and not mixer_seen:
+            current = int.from_bytes(stream[off : off + size], "little")
+            seen.add(current)
+        elif event_id == EVENT_MIXER_FLAGS:
+            mixer_seen = True
+            current = None
+        elif _is_channel_scoped(event_id) and not mixer_seen:
+            if current is None:
+                current = 0
+                seen.add(0)
+            if current == channel:
+                if event_id == EVENT_CHANNEL_TYPE and size == 1:
+                    kind = stream[off]
+                elif event_id == EVENT_CHANNEL_AUTOMATION and auto_event is None:
+                    auto_event = (head, off, size)
+
+    if channel not in seen:
+        raise IndexError(f"no channel {channel}; project has {len(seen)}")
+    if kind != CHANNEL_TYPE_AUTOMATION:
+        raise FlpError(
+            f"channel {channel} is kind {kind}, not an automation channel "
+            f"(kind {CHANNEL_TYPE_AUTOMATION}); refusing to write points into it"
+        )
+    if auto_event is None:
+        raise FlpError(
+            f"channel {channel} has no automation blob (event "
+            f"{EVENT_CHANNEL_AUTOMATION}); write_automation patches existing "
+            "clips only - creating one needs undecoded header/trailer/link bytes"
+        )
+
+    head, off, size = auto_event
+    blob = bytes(stream[off : off + size])
+    if len(blob) < _AUTOMATION_POINTS_AT:
+        raise FlpError(
+            f"channel {channel} automation blob of {len(blob)} bytes is "
+            "truncated; no honest header to carry"
+        )
+    (old_count,) = struct.unpack_from("<I", blob, _AUTOMATION_COUNT_AT)
+    points_end = _AUTOMATION_POINTS_AT + old_count * _AUTOMATION_POINT_SIZE
+    if points_end > len(blob):
+        raise FlpError(
+            f"channel {channel} automation blob claims {old_count} points but "
+            f"holds {len(blob)} bytes; refusing to guess where the trailer starts"
+        )
+
+    body = bytearray(blob[:_AUTOMATION_COUNT_AT])  # header, verbatim
+    body += struct.pack("<I", len(ordered))
+    prev = 0.0
+    for p in ordered:
+        tail = getattr(p, "tail", None)
+        body += struct.pack("<ddf", p.position - prev, p.value, p.tension)
+        body += bytes(tail) if tail is not None else AUTOMATION_TAIL_DEFAULT
+        prev = p.position
+    body += blob[points_end:]  # the era trailer, verbatim
+
+    _replace_event(data, base, head, off, size, _frame_event(EVENT_CHANNEL_AUTOMATION, bytes(body)))
+    path.write_bytes(bytes(data))
+
+    # Deterministic byte surgery: the saved channel must decode to exactly
+    # what the built blob decodes to; any drift is a writer bug, not tolerance.
+    expected = _decode_automation(bytes(body), 0)
+    saved = next(
+        c
+        for c in read(path, event_size_overrides=event_size_overrides).channels
+        if c.index == channel
+    )
+    if saved.automation != expected:
+        raise FlpError(
+            f"channel {channel} automation readback does not match the write: "
+            f"saved {len(saved.automation)} points, expected {len(expected)}"
+        )
+    return len(ordered)
 
 
 # -- helpers (each = exactly one wire-format job) --------------------------------
@@ -744,25 +989,48 @@ def _chunks(data: bytes) -> tuple[bytes, memoryview]:
 # "Basic with limiter" loses a channel AND its tempo event to the desync.
 # pyflp shares the 4-byte bug (it cannot parse fresh FL 2026 saves at all),
 # so this table is where flpkit deliberately diverges from the oracle.
-_EVENT_SIZE_OVERRIDES = {172: 1}
+# It is the FALLBACK: every public function takes ``event_size_overrides`` so
+# a capability profile's offline-detected table wins over this hardcoded one
+# (detect-don't-assume); falling back here is logged once per process.
+EVENT_SIZE_OVERRIDES_FALLBACK: Mapping[int, int] = {172: 1}
 
 
-def _events(stream: memoryview) -> Iterator[tuple[int, int, int]]:
+@functools.cache
+def _log_size_override_fallback() -> None:
+    log.info(
+        "no event_size_overrides provided; falling back to the built-in "
+        "FL-2026-measured table %r (a capability profile can supply the "
+        "detected table for other FL versions)",
+        EVENT_SIZE_OVERRIDES_FALLBACK,
+    )
+
+
+def _resolve_size_overrides(overrides: Mapping[int, int] | None) -> Mapping[int, int]:
+    if overrides is not None:
+        return overrides
+    _log_size_override_fallback()
+    return EVENT_SIZE_OVERRIDES_FALLBACK
+
+
+def _events(
+    stream: memoryview, overrides: Mapping[int, int] | None = None
+) -> Iterator[tuple[int, int, int]]:
     """Yield (event_id, payload_offset, payload_size). Encoding: id < 64 ->
     1 data byte, 64-127 -> 2, 128-191 -> 4, 192+ -> varint length + payload,
-    except the measured overrides in _EVENT_SIZE_OVERRIDES.
+    except the measured ``overrides`` (EVENT_SIZE_OVERRIDES_FALLBACK when None).
 
     Offsets are relative to the event stream (add the FLdt payload's file
     offset for an absolute position). Raises FlpError on truncation.
     """
+    overrides = _resolve_size_overrides(overrides)
     end = len(stream)
     pos = 0
     while pos < end:
         head = pos
         event_id = stream[pos]
         pos += 1
-        if event_id in _EVENT_SIZE_OVERRIDES:
-            size = _EVENT_SIZE_OVERRIDES[event_id]
+        if event_id in overrides:
+            size = overrides[event_id]
         elif event_id < 192:
             size = 1 if event_id < 64 else 2 if event_id < 128 else 4
         else:
@@ -791,10 +1059,50 @@ def _events(stream: memoryview) -> Iterator[tuple[int, int, int]]:
 def _splice(data: bytearray, at: int, event: bytes) -> None:
     """Insert event bytes at ``at`` and bump the FLdt chunk length to match."""
     data[at:at] = event
+    _bump_fldt_length(data, len(event))
+
+
+def _replace_event(
+    data: bytearray, base: int, head: int, off: int, size: int, event: bytes
+) -> None:
+    """Swap the event spanning stream offsets [head, off + size) for ``event``
+    and fix the FLdt chunk length by the extent difference."""
+    old_extent = (off + size) - head
+    data[base + head : base + off + size] = event
+    _bump_fldt_length(data, len(event) - old_extent)
+
+
+def _bump_fldt_length(data: bytearray, delta: int) -> None:
     hd_len = int.from_bytes(data[4:8], "little")
     dt_len_off = 8 + hd_len + 4
     old_len = int.from_bytes(data[dt_len_off : dt_len_off + 4], "little")
-    data[dt_len_off : dt_len_off + 4] = (old_len + len(event)).to_bytes(4, "little")
+    data[dt_len_off : dt_len_off + 4] = (old_len + delta).to_bytes(4, "little")
+
+
+def _verify_readback(
+    result: Sequence[object],
+    expected: Sequence[object],
+    matches,
+    *,
+    mode: NoteWriteMode,
+    context: str,
+    noun: str,
+    describe=repr,
+) -> None:
+    """The readback contract every splice writer shares: each sent item must
+    be found (once) in the saved file's decode, and a replace write may leave
+    nothing beyond the sent set. Raises FlpError naming the first violation."""
+    pool = list(result)
+    for want in expected:
+        got = next((g for g in pool if matches(want, g)), None)
+        if got is None:
+            raise FlpError(f"readback of {context} is missing a sent {noun}: {describe(want)}")
+        pool.remove(got)
+    if mode == "replace" and pool:
+        raise FlpError(
+            f"readback of {context} has {len(pool)} {noun}s beyond the replace "
+            f"set, e.g. {pool[0]}"
+        )
 
 
 def _without_channel(blob: bytes, channel: int) -> bytes:
@@ -939,11 +1247,17 @@ def _decode_automation(blob: bytes, offset: int) -> tuple[FlpAutomationPoint, ..
     points = []
     position = 0.0
     for i in range(count):
-        delta, value, tension = struct.unpack_from(
-            "<ddf", blob, _AUTOMATION_POINTS_AT + i * _AUTOMATION_POINT_SIZE
-        )
+        at = _AUTOMATION_POINTS_AT + i * _AUTOMATION_POINT_SIZE
+        delta, value, tension = struct.unpack_from("<ddf", blob, at)
         position += delta
-        points.append(FlpAutomationPoint(position=position, value=value, tension=tension))
+        points.append(
+            FlpAutomationPoint(
+                position=position,
+                value=value,
+                tension=tension,
+                tail=bytes(blob[at + _AUTOMATION_TAIL_AT : at + _AUTOMATION_POINT_SIZE]),
+            )
+        )
     return tuple(points)
 
 
@@ -996,13 +1310,17 @@ def _build_channel(fields: dict[str, int | str | tuple[FlpAutomationPoint, ...]]
     )
 
 
-def _encode_notes(notes: Sequence[NoteLike], channel: int, ppq: int) -> bytes:
-    """Pack tool-unit notes into NOTE_STRUCT records (ticks, 0-127 velocity)."""
+def _encode_notes(
+    notes: Sequence[NoteLike], channel: int, ppq: int, flags: int = NOTE_FLAGS_DEFAULT
+) -> bytes:
+    """Pack tool-unit notes into NOTE_STRUCT records (ticks, 0-127 velocity).
+    ``flags`` is templated from the target file's own notes where it has any
+    (write_notes passes it); the corpus-surveyed default covers the rest."""
     packed = bytearray()
     for note in notes:
         packed += NOTE_STRUCT.pack(
             round(note.start * ppq),  # position, ticks
-            NOTE_FLAGS_DEFAULT,  # FL sets 0x4000 on every note it writes
+            flags,  # note flags word (see NOTE_FLAGS_DEFAULT)
             channel,  # rack_channel
             max(1, round(note.length * ppq)),  # length, ticks (never 0)
             note.key,  # MIDI number

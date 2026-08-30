@@ -441,3 +441,327 @@ def test_write_playlist_rejects_track_out_of_space(tmp_path):
     )
     with pytest.raises(ValueError, match="track"):
         flp.write_playlist(path, [flp.ClipSpec(pattern=1, track=0, start=0.0, length=1.0)])
+
+
+def test_write_playlist_refuses_when_a_record_has_a_cut_window(tmp_path):
+    """The cut-window layout (u32 start/end in ticks at bytes 24-31) is only
+    FL-2026-verified for records that span 0..length. A record that does not -
+    a genuinely cut clip, or an earlier era whose bytes 24-31 mean something
+    else - must refuse the write instead of clobbering unknown semantics."""
+    record = bytearray(playlist_record(88, position=0, item_index=20481, length=96, track=1))
+    struct.pack_into("<II", record, 24, 24, 96)  # a clip cut to start at tick 24
+    path = playlist_file(tmp_path, bytes(record))
+    before = path.read_bytes()
+
+    with pytest.raises(flp.FlpError, match="cut window"):
+        flp.write_playlist(path, [flp.ClipSpec(pattern=2, track=2, start=0.0, length=1.0)])
+    assert path.read_bytes() == before  # refused writes touch nothing
+
+
+def test_write_playlist_refuses_when_window_end_is_not_length(tmp_path):
+    record = bytearray(playlist_record(88, position=0, item_index=20481, length=96, track=1))
+    struct.pack_into("<II", record, 24, 0, 48)  # window shorter than the clip
+    path = playlist_file(tmp_path, bytes(record))
+    with pytest.raises(flp.FlpError, match="cut window"):
+        flp.write_playlist(path, [flp.ClipSpec(pattern=2, track=2, start=0.0, length=1.0)])
+
+
+# -- detect-don't-assume: event-size overrides ---------------------------------
+
+
+def stream_with_172() -> bytes:
+    return (
+        VERSION_MODERN
+        + bytes([172, 0x01])  # the 1-byte event FL 2026 writes
+        + event(flp.EVENT_TEMPO, struct.pack("<I", 130_000))
+        + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", 0))
+    )
+
+
+def test_read_accepts_explicit_event_size_overrides(tmp_path):
+    path = write_flp(tmp_path, stream_with_172())
+    project = flp.read(path, event_size_overrides={172: 1})
+    assert project.tempo == 130.0
+    assert len(project.channels) == 1
+
+
+def test_read_with_empty_overrides_shows_the_classic_rule_desync(tmp_path):
+    """Passing an explicit table REPLACES the fallback: with no 172 entry the
+    classic 4-byte rule applies and the walker desyncs, eating the tempo event
+    - the exact failure class the override table exists to prevent."""
+    path = write_flp(tmp_path, stream_with_172())
+    assert flp.read(path, event_size_overrides={}).tempo is None
+
+
+def test_writers_thread_event_size_overrides_through(tmp_path):
+    path = write_flp(tmp_path, stream_with_172())
+    stored = flp.set_tempo(path, 141, event_size_overrides={172: 1})
+    assert stored == 141.0
+    (note,) = flp.write_notes(
+        path, [Note(key=60, start=0.0, length=1.0)],
+        pattern=1, channel=0, mode="replace", event_size_overrides={172: 1},
+    )
+    assert note.key == 60
+
+
+def test_fallback_override_table_is_logged_once_per_process(tmp_path, caplog):
+    flp._log_size_override_fallback.cache_clear()
+    path = write_flp(tmp_path, stream_with_172())
+    with caplog.at_level("INFO", logger="flpkit"):
+        flp.read(path)
+        flp.read(path)
+    hits = [r for r in caplog.records if "event_size_overrides" in r.message]
+    assert len(hits) == 1  # once per process, not once per call
+    caplog.clear()
+    with caplog.at_level("INFO", logger="flpkit"):
+        flp.read(path, event_size_overrides={172: 1})
+    assert not [r for r in caplog.records if "event_size_overrides" in r.message]
+
+
+# -- detect-don't-assume: note flags templated from the file -------------------
+
+
+def notes_blob_flags(path) -> list[int]:
+    """The flags word of every note record in the saved file's 224 events."""
+    data = path.read_bytes()
+    _header, stream = flp._chunks(data)
+    flags = []
+    for event_id, off, size in flp._events(stream):
+        if event_id == flp.EVENT_PATTERN_NOTES and size % flp.NOTE_SIZE == 0:
+            flags.extend(
+                int.from_bytes(stream[off + at + 4 : off + at + 6], "little")
+                for at in range(0, size, flp.NOTE_SIZE)
+            )
+    return flags
+
+
+def test_new_notes_template_flags_from_the_files_existing_notes(tmp_path):
+    existing = note_record(position=0, key=48, flags=0x4008)
+    path = write_flp(tmp_path, VERSION_MODERN + pattern_events(1, existing))
+
+    flp.write_notes(path, [Note(key=72, start=2.0, length=1.0)], pattern=1, channel=0, mode="merge")
+
+    assert notes_blob_flags(path) == [0x4008, 0x4008]
+
+
+def test_new_notes_use_the_most_common_flags_in_the_file(tmp_path):
+    blob = (
+        note_record(position=0, key=48, flags=0x4000)
+        + note_record(position=24, key=50, flags=0x4000)
+        + note_record(position=48, key=52, flags=0x4008)
+    )
+    path = write_flp(tmp_path, VERSION_MODERN + pattern_events(1, blob))
+
+    flp.write_notes(path, [Note(key=72, start=4.0, length=1.0)], pattern=2, channel=0, mode="merge")
+
+    assert notes_blob_flags(path).count(0x4000) == 3  # the majority flags won
+
+
+def test_new_notes_fall_back_to_the_corpus_flags_constant(tmp_path):
+    path = write_flp(tmp_path, VERSION_MODERN)
+
+    flp.write_notes(path, [Note(key=60, start=0.0, length=1.0)], pattern=1, channel=0, mode="replace")
+
+    assert notes_blob_flags(path) == [flp.NOTE_FLAGS_DEFAULT]
+
+
+# -- write_automation ----------------------------------------------------------
+
+from test_reader import automation_blob  # noqa: E402
+
+DISTINCT_HEADER = bytes(range(1, 18))  # 17 distinctive header bytes
+DISTINCT_TRAILER = bytes(range(100, 212))  # 112 distinctive trailer bytes
+
+
+def automation_events(blob: bytes, iid: int = 0, kind: int | None = flp.CHANNEL_TYPE_AUTOMATION) -> bytes:
+    out = VERSION_MODERN + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", iid))
+    if kind is not None:
+        out += event(flp.EVENT_CHANNEL_TYPE, bytes([kind]))
+    if blob:
+        out += event(flp.EVENT_CHANNEL_AUTOMATION, blob)
+    return out
+
+
+def distinct_blob(points: list[tuple[float, float, float]]) -> bytes:
+    body = bytearray(DISTINCT_HEADER)
+    body += struct.pack("<I", len(points))
+    for delta, value, tension in points:
+        body += struct.pack("<ddf", delta, value, tension) + bytes(4)
+    return bytes(body) + DISTINCT_TRAILER
+
+
+def test_write_automation_replaces_points_and_reads_back(tmp_path):
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)])))
+
+    written = flp.write_automation(path, 0, [
+        flp.AutomationPointSpec(position=0.0, value=0.25),
+        flp.AutomationPointSpec(position=4.0, value=0.75, tension=-0.5),
+        flp.AutomationPointSpec(position=8.0, value=1.0),
+    ])
+
+    assert written == 3
+    (channel,) = flp.read(path).channels
+    assert [(p.position, p.value) for p in channel.automation] == [
+        (0.0, 0.25), (4.0, 0.75), (8.0, 1.0)
+    ]
+    assert channel.automation[1].tension == pytest.approx(-0.5)
+
+
+def test_write_automation_carries_header_and_trailer_verbatim(tmp_path):
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)])))
+
+    flp.write_automation(path, 0, [
+        flp.AutomationPointSpec(position=1.0, value=0.5),
+        flp.AutomationPointSpec(position=2.0, value=0.5),
+    ])
+
+    data = path.read_bytes()
+    head_at = data.find(DISTINCT_HEADER)
+    assert head_at != -1
+    # count changed from 1 to 2 but the header and the era trailer are FL's
+    # own bytes, untouched.
+    assert struct.unpack_from("<I", data, head_at + 17)[0] == 2
+    assert data.find(DISTINCT_TRAILER) == head_at + 17 + 4 + 2 * 24
+
+
+def test_write_automation_converts_absolute_positions_to_deltas(tmp_path):
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)])))
+
+    flp.write_automation(path, 0, [
+        flp.AutomationPointSpec(position=1.0, value=0.1),
+        flp.AutomationPointSpec(position=2.5, value=0.2),
+        flp.AutomationPointSpec(position=4.0, value=0.3),
+    ])
+
+    data = path.read_bytes()
+    at = data.find(DISTINCT_HEADER) + 21
+    deltas = [struct.unpack_from("<d", data, at + i * 24)[0] for i in range(3)]
+    assert deltas == [1.0, 1.5, 1.5]
+
+
+def test_write_automation_sorts_points_by_position(tmp_path):
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)])))
+
+    flp.write_automation(path, 0, [
+        flp.AutomationPointSpec(position=8.0, value=0.9),
+        flp.AutomationPointSpec(position=0.0, value=0.1),
+    ])
+
+    (channel,) = flp.read(path).channels
+    assert [(p.position, p.value) for p in channel.automation] == [(0.0, 0.1), (8.0, 0.9)]
+
+
+def test_write_automation_decode_rewrite_is_byte_identical(tmp_path):
+    """Feeding a channel's decoded points straight back must rewrite the file
+    byte-identically - the writer proves the reader (varied per-point tails
+    and all)."""
+    blob = automation_blob(
+        [(0.5, 0.25, 0.0), (1.5, 0.5, 0.3), (2.0, 1.0, -0.4)],
+        point_tails=[b"\x00\x00\x00\x00", b"\x00\x00\x00\xff", b"\x00\x00\x00\x02"],
+    )
+    path = write_flp(tmp_path, automation_events(blob))
+    before = path.read_bytes()
+
+    (channel,) = flp.read(path).channels
+    written = flp.write_automation(path, 0, channel.automation)
+
+    assert written == 3
+    assert path.read_bytes() == before
+
+
+def test_write_automation_empty_replace_clears_the_points(tmp_path):
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)])))
+
+    assert flp.write_automation(path, 0, []) == 0
+
+    (channel,) = flp.read(path).channels
+    assert channel.automation == ()
+    data = path.read_bytes()
+    assert data.find(DISTINCT_TRAILER) == data.find(DISTINCT_HEADER) + 21
+
+
+def test_write_automation_refuses_a_non_automation_channel(tmp_path):
+    # kind 0 = a generator channel; its 234 event (if any) is not a curve.
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)]), kind=0))
+    before = path.read_bytes()
+    with pytest.raises(flp.FlpError, match="not an automation channel"):
+        flp.write_automation(path, 0, [flp.AutomationPointSpec(position=0.0, value=0.5)])
+    assert path.read_bytes() == before
+
+
+def test_write_automation_refuses_a_channel_without_a_kind(tmp_path):
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)]), kind=None))
+    with pytest.raises(flp.FlpError, match="not an automation channel"):
+        flp.write_automation(path, 0, [flp.AutomationPointSpec(position=0.0, value=0.5)])
+
+
+def test_write_automation_refuses_a_channel_without_a_blob(tmp_path):
+    path = write_flp(tmp_path, automation_events(b""))
+    with pytest.raises(flp.FlpError, match="no automation blob"):
+        flp.write_automation(path, 0, [flp.AutomationPointSpec(position=0.0, value=0.5)])
+
+
+def test_write_automation_unknown_channel_raises_index_error(tmp_path):
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)])))
+    with pytest.raises(IndexError, match="no channel 7"):
+        flp.write_automation(path, 7, [flp.AutomationPointSpec(position=0.0, value=0.5)])
+
+
+def test_write_automation_refuses_a_blob_with_a_lying_count(tmp_path):
+    blob = distinct_blob([(0.0, 1.0, 0.0)])[:30]  # count says 1, points cut off
+    path = write_flp(tmp_path, automation_events(blob))
+    before = path.read_bytes()
+    with pytest.raises(flp.FlpError, match="claims 1 point"):
+        flp.write_automation(path, 0, [flp.AutomationPointSpec(position=0.0, value=0.5)])
+    assert path.read_bytes() == before
+
+
+def test_write_automation_validates_inputs(tmp_path):
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)])))
+    before = path.read_bytes()
+    cases = [
+        ([flp.AutomationPointSpec(position=0.0, value=2.0)], "value"),
+        ([flp.AutomationPointSpec(position=0.0, value=-0.5)], "value"),
+        ([flp.AutomationPointSpec(position=0.0, value=0.5, tension=1.5)], "tension"),
+        ([flp.AutomationPointSpec(position=-1.0, value=0.5)], "negative"),
+        ([flp.FlpAutomationPoint(position=0.0, value=0.5, tension=0.0, tail=b"\x00")], "tail"),
+    ]
+    for points, match in cases:
+        with pytest.raises(ValueError, match=match):
+            flp.write_automation(path, 0, points)
+    with pytest.raises(ValueError, match="mode"):
+        flp.write_automation(
+            path, 0, [flp.AutomationPointSpec(position=0.0, value=0.5)], mode="merge"
+        )
+    assert path.read_bytes() == before
+
+
+def test_write_automation_accepts_fl_style_value_overshoot(tmp_path):
+    # FL itself stores values a hair above 1.0 (corpus max 1.0000403); refusing
+    # them would refuse FL's own data.
+    path = write_flp(tmp_path, automation_events(distinct_blob([(0.0, 1.0, 0.0)])))
+    assert flp.write_automation(
+        path, 0, [flp.AutomationPointSpec(position=0.0, value=1.0000403)]
+    ) == 1
+
+
+def test_write_automation_targets_only_the_requested_channel(tmp_path):
+    first = distinct_blob([(0.0, 0.1, 0.0)])
+    second = automation_blob([(0.0, 0.9, 0.0)])
+    events = (
+        VERSION_MODERN
+        + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", 0))
+        + event(flp.EVENT_CHANNEL_TYPE, bytes([flp.CHANNEL_TYPE_AUTOMATION]))
+        + event(flp.EVENT_CHANNEL_AUTOMATION, first)
+        + event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", 1))
+        + event(flp.EVENT_CHANNEL_TYPE, bytes([flp.CHANNEL_TYPE_AUTOMATION]))
+        + event(flp.EVENT_CHANNEL_AUTOMATION, second)
+    )
+    path = write_flp(tmp_path, events, n_channels=2)
+
+    flp.write_automation(path, 1, [flp.AutomationPointSpec(position=2.0, value=0.5)])
+
+    channels = flp.read(path).channels
+    assert [(p.position, p.value) for p in channels[0].automation] == [(0.0, 0.1)]
+    assert [(p.position, p.value) for p in channels[1].automation] == [(2.0, 0.5)]
+    assert path.read_bytes().find(first) != -1  # channel 0's blob is untouched bytes
