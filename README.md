@@ -43,6 +43,22 @@ Every writer then **verifies itself**: it re-reads the saved file and field-matc
   Feeding a channel's decoded points straight back rewrites its blob byte-identically (verified across all 1,100 corpus blobs).
   Creating a NEW clip is out of scope until the link bytes are decoded - a non-automation channel or a missing blob is an error, not an invitation to fabricate
 
+## One engine, formats as data (0.6.0)
+
+Every writer and element reader above flows through ONE generic engine, `flpkit.codec`:
+
+```python
+from flpkit import codec
+from flpkit.formats import NotesFormat
+
+notes = codec.read(path, NotesFormat(), codec.Target(pattern=1, channel=0))
+codec.patch(path, NotesFormat(), codec.Target(pattern=1, channel=0), notes, mode="merge")
+```
+
+A `Format` (see `flpkit/formats/`) states one `.flp` element - `locate`, `encode`, `decode`, `verify` - and the engine does the rest: splice, chunk-length fixing, and verify-by-readback live in `codec.patch`, once.
+Reading `formats/notes.py` plus `codec.py` tells you everything about how notes work; the same goes for playlist, automation, levels, and tempo.
+The public functions (`write_notes`, `set_tempo`, ...) are thin shims over `codec.patch`, and `tests/test_differential.py` proves the codec writes byte-identical output to the pre-0.6.0 hand-rolled writers.
+
 ## Detect, don't assume
 
 Format constants are DETECTED from the file itself wherever the data carries an invariant, with hardcoded values only as logged fallbacks:
