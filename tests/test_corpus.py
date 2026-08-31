@@ -57,6 +57,40 @@ def test_corpus_automation_decode_rewrite_is_byte_identical(tmp_path):
 
 
 @requires_fl
+def test_corpus_notes_and_playlist_reencode_byte_identical():
+    """encode(decode(blob)) == blob for EVERY notes and playlist event in the
+    corpus - the byte-faithful contract that makes kept items safe through any
+    patch. Catches the length-0 note records FL's own demos carry (G5 fuzz
+    finding: 29 files; a max(1, .) floor in encode silently mutated them)."""
+    notes_fmt, playlist_fmt = flp.NotesFormat(), flp.PlaylistFormat()
+    checked = zero_length = 0
+    for source in corpus_files():
+        data = source.read_bytes()
+        try:
+            header, stream = flp._chunks(data)
+        except flp.FlpError:
+            continue
+        ppq = int.from_bytes(header[4:6], "little")
+        for event_id, off, size in flp._events(stream):
+            blob = bytes(stream[off : off + size])
+            if event_id == flp.EVENT_PATTERN_NOTES and size and size % flp.NOTE_SIZE == 0:
+                decoded = notes_fmt.decode(blob, ppq)
+                zero_length += sum(1 for n in decoded if n.length == 0)
+            elif event_id == flp.EVENT_PLAYLIST and blob:
+                try:
+                    decoded = playlist_fmt.decode(blob, ppq)
+                except flp.FlpError:
+                    continue  # unresolvable stride is the reader's concern
+            else:
+                continue
+            fmt = notes_fmt if event_id == flp.EVENT_PATTERN_NOTES else playlist_fmt
+            assert fmt.encode(decoded, ppq) == blob, f"{source.name}: {fmt.name} event at {off}"
+            checked += 1
+    assert checked >= 500, f"only {checked} events exercised"
+    assert zero_length >= 1000, f"only {zero_length} zero-length notes seen (corpus carries thousands)"
+
+
+@requires_fl
 def test_corpus_files_all_read(tmp_path):
     """Every FL-authored project parses: the never-crash contract corpus-wide."""
     files = corpus_files()
