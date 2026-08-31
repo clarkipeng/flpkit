@@ -461,40 +461,25 @@ def test_write_playlist_rejects_track_out_of_space(tmp_path):
         flp.write_playlist(path, [flp.ClipSpec(pattern=1, track=0, start=0.0, length=1.0)])
 
 
-def test_write_playlist_refuses_when_a_record_has_a_cut_window(tmp_path):
-    """The cut-window layout (u32 start/end in ticks at bytes 24-31) is only
-    FL-2026-verified for records that span 0..length. A record that does not -
-    a genuinely cut clip, or an earlier era whose bytes 24-31 mean something
-    else - must refuse the write instead of clobbering unknown semantics."""
+@pytest.mark.parametrize(
+    "window",
+    [(0xBF800000, 0xBF800000), (0, 0x43B80000), (24, 96)],
+    ids=["legacy-uncut-sentinel", "legacy-f32-end", "cut-clip"],
+)
+def test_write_playlist_carries_existing_windows_verbatim(tmp_path, window):
+    """Existing records' window bytes are era-opaque and untouched: legacy
+    eras stamp f32 shapes there, and cut clips carry real windows. flpkit 0.4
+    wrote all of these and the fl-studio-mcp e2e matrix live-verified FL 2026
+    accepting the modern window on NEW records beside them (a 0.6.0 guard
+    refused these files - the regression the matrix caught on the pin bump)."""
     record = bytearray(playlist_record(88, position=0, item_index=20481, length=96, track=1))
-    struct.pack_into("<II", record, 24, 24, 96)  # a clip cut to start at tick 24
-    path = playlist_file(tmp_path, bytes(record))
-    before = path.read_bytes()
-
-    with pytest.raises(flp.FlpError, match="cut window"):
-        flp.write_playlist(path, [flp.ClipSpec(pattern=2, track=2, start=0.0, length=1.0)])
-    assert path.read_bytes() == before  # refused writes touch nothing
-
-
-def test_write_playlist_accepts_the_legacy_uncut_sentinel(tmp_path):
-    """Earlier eras stamp f32 -1.0 bits (u32 0xBF800000) in BOTH window fields
-    as their uncut marker - FL-bundled legacy projects carry it and FL 2026
-    opens them fine. flpkit 0.4 wrote these files; the 0.6 guard must keep
-    accepting them (found by fl-studio-mcp's e2e matrix on the pin bump)."""
-    record = bytearray(playlist_record(88, position=0, item_index=20481, length=96, track=1))
-    struct.pack_into("<II", record, 24, 0xBF800000, 0xBF800000)
+    struct.pack_into("<II", record, 24, *window)
     path = playlist_file(tmp_path, bytes(record))
 
     clips = flp.write_playlist(path, [flp.ClipSpec(pattern=2, track=2, start=1.0, length=1.0)])
     assert len(clips) == 2  # template clip + the new one, re-read from the file
-
-
-def test_write_playlist_refuses_when_window_end_is_not_length(tmp_path):
-    record = bytearray(playlist_record(88, position=0, item_index=20481, length=96, track=1))
-    struct.pack_into("<II", record, 24, 0, 48)  # window shorter than the clip
-    path = playlist_file(tmp_path, bytes(record))
-    with pytest.raises(flp.FlpError, match="cut window"):
-        flp.write_playlist(path, [flp.ClipSpec(pattern=2, track=2, start=0.0, length=1.0)])
+    blob = path.read_bytes()
+    assert struct.pack("<II", *window) in blob  # the existing record's window survived
 
 
 # -- detect-don't-assume: event-size overrides ---------------------------------
