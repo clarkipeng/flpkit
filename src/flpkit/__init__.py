@@ -94,6 +94,18 @@ def _events(stream, event_size_overrides: Mapping[int, int] | None = None):
     return iter(codec.Stream(stream, event_size_overrides))
 
 
+# Private v0.5.0 aliases still imported by mcp-server's tests/e2e/matrix.py;
+# the integration manager retires them when matrix.py ports to codec/detect.
+_is_channel_scoped = codec.is_channel_scoped
+_playlist_stride_fits = detect._stride_fits
+
+
+def _splice(data: bytearray, at: int, event: bytes) -> None:
+    """Insert event bytes at ``at`` and bump the FLdt chunk length to match."""
+    data[at:at] = event
+    codec._bump_fldt_length(data, len(event))
+
+
 # -- the decoded read-only project view ---------------------------------------
 
 

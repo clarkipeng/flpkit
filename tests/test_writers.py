@@ -225,6 +225,24 @@ def test_write_notes_result_still_a_valid_flp(tmp_path):
     assert len(flp.read(path).notes_in(1)) == 64
 
 
+def test_patch_keeps_zero_length_notes_byte_identical(tmp_path):
+    """FL's own demos carry note records with raw length 0 (29 corpus files,
+    e.g. 601 in 'Astes - Bien Duro'); an identity patch must not mutate them
+    to 1 tick (G5 fuzz finding: encode once floored length with max(1, .))."""
+    from flpkit import codec
+
+    blob = note_record(position=0, key=60, length=0) + note_record(position=24, key=62, length=0)
+    path = write_flp(tmp_path, VERSION_MODERN + pattern_events(1, blob))
+    before = path.read_bytes()
+
+    target = codec.Target(pattern=1, channel=0)
+    items = codec.read(path, flp.NotesFormat(), target)
+    assert [i.length for i in items] == [0.0, 0.0]
+    codec.patch(path, flp.NotesFormat(), target, items, "replace")
+
+    assert path.read_bytes() == before
+
+
 def channel_with_levels(iid: int, pan: int = 6400, volume: int = 10000, pitch: int = 0) -> bytes:
     return event(flp.EVENT_CHANNEL_NEW, struct.pack("<H", iid)) + event(
         flp.EVENT_CHANNEL_LEVELS, struct.pack("<iIi", pan, volume, pitch) + b"\0" * 12

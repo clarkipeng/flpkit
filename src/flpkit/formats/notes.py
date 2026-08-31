@@ -158,16 +158,20 @@ class NotesFormat:
         flags word from the file's own template (locate surveyed it; the
         corpus constant covers a file with no notes yet), and the rack channel
         from the write target."""
-        flags = self._flags if self._flags is not None else NOTE_FLAGS_DEFAULT
-        if self._flags is None and data:
+        flags = getattr(self, "_flags", None)  # locate's survey; None standalone or file had no notes
+        if flags is None:
+            flags = NOTE_FLAGS_DEFAULT
             log.debug("no existing notes to template flags from; using the corpus default 0x%04x", flags)
         packed = bytearray()
         for note in data:
             packed += NOTE_STRUCT.pack(
                 round(note.start * ppq),
                 getattr(note, "flags", flags),
-                getattr(note, "channel", self._channel) or 0,
-                max(1, round(note.length * ppq)),  # length in ticks, never 0
+                getattr(note, "channel", getattr(self, "_channel", None)) or 0,
+                # Length packs exactly as quantized - NO floor to 1: FL's own
+                # demos carry length-0 records (29 corpus files, e.g. 601 in
+                # 'Astes - Bien Duro'), so kept notes must round-trip raw 0.
+                round(note.length * ppq),
                 note.key,
                 getattr(note, "group", 0),
                 getattr(note, "fine_pitch", FINE_PITCH_CENTER),

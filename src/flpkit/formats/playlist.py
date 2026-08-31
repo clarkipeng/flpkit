@@ -124,16 +124,22 @@ class PlaylistFormat:
         arrangements are stored that way). New records inherit the template's
         era tail with the uncut window packed in; decoded clips carry their
         own tail verbatim."""
-        if self._refusal:
-            raise FlpError(self._refusal)
+        refusal = getattr(self, "_refusal", None)  # set by locate on the write path
+        if refusal:
+            raise FlpError(refusal)
         records = []
         for clip in data:
             if not 1 <= clip.track <= PLAYLIST_TRACK_SPACE:
                 raise ValueError(f"track {clip.track} outside 1..{PLAYLIST_TRACK_SPACE}")
-            length = max(1, round(clip.length * ppq))
+            # Exactly as quantized, no floor - decoded records must round-trip
+            # their raw length byte-identically (same rule as notes).
+            length = round(clip.length * ppq)
             tail = getattr(clip, "tail", b"")
             if not tail:
-                tail = bytearray(self._template[RECORD_HEAD.size :])
+                template = getattr(self, "_template", None)
+                if template is None:
+                    raise FlpError("a new clip needs the located byte template; write through codec.patch")
+                tail = bytearray(template[RECORD_HEAD.size :])
                 struct.pack_into("<II", tail, _WINDOW_AT - RECORD_HEAD.size, 0, length)
             pattern = getattr(clip, "pattern", None)
             item_index = PATTERN_INDEX_BASE + pattern if pattern is not None else clip.channel
