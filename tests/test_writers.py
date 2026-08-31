@@ -476,6 +476,19 @@ def test_write_playlist_refuses_when_a_record_has_a_cut_window(tmp_path):
     assert path.read_bytes() == before  # refused writes touch nothing
 
 
+def test_write_playlist_accepts_the_legacy_uncut_sentinel(tmp_path):
+    """Earlier eras stamp f32 -1.0 bits (u32 0xBF800000) in BOTH window fields
+    as their uncut marker - FL-bundled legacy projects carry it and FL 2026
+    opens them fine. flpkit 0.4 wrote these files; the 0.6 guard must keep
+    accepting them (found by fl-studio-mcp's e2e matrix on the pin bump)."""
+    record = bytearray(playlist_record(88, position=0, item_index=20481, length=96, track=1))
+    struct.pack_into("<II", record, 24, 0xBF800000, 0xBF800000)
+    path = playlist_file(tmp_path, bytes(record))
+
+    clips = flp.write_playlist(path, [flp.ClipSpec(pattern=2, track=2, start=1.0, length=1.0)])
+    assert len(clips) == 2  # template clip + the new one, re-read from the file
+
+
 def test_write_playlist_refuses_when_window_end_is_not_length(tmp_path):
     record = bytearray(playlist_record(88, position=0, item_index=20481, length=96, track=1))
     struct.pack_into("<II", record, 24, 0, 48)  # window shorter than the clip

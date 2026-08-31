@@ -25,11 +25,13 @@ RECORD_HEAD = struct.Struct("<IHHIHH")  # position, pattern_base, item_index, le
 # the f32 offsets pyflp documents. Proven live: FL 2026 derives the visible
 # clip length from this window (a zeroed window collapsed the clip to length 1
 # and FL rewrote the head length field to match on its next save). An uncut
-# clip spans 0..length. That layout is only trusted where the file ITSELF
-# exhibits it: every existing record must span its full length, or the write
-# refuses - a record that does not is a genuinely cut clip, or an earlier era
-# whose bytes 24-31 mean something unverified.
+# clip spans 0..length; earlier eras stamp the f32 -1.0 bit pattern in BOTH
+# fields as their uncut sentinel (corpus: FL-bundled demo/legacy projects,
+# which FL 2026 itself opens and rewrites). The layout is only trusted where
+# the file ITSELF exhibits a verified shape - the full span or the legacy
+# sentinel; anything else (including a genuine cut) still refuses.
 _WINDOW_AT = 24
+_LEGACY_UNCUT = 0xBF800000  # f32 -1.0 bits, read as our u32 model
 
 
 class ClipLike(Protocol):
@@ -107,7 +109,7 @@ class PlaylistFormat:
         for at in range(0, len(blob), stride):
             (length,) = struct.unpack_from("<I", blob, at + 8)
             window = struct.unpack_from("<II", blob, at + _WINDOW_AT)
-            if window != (0, length):
+            if window != (0, length) and window != (_LEGACY_UNCUT, _LEGACY_UNCUT):
                 self._refusal = (
                     f"arrangement {arrangement}: record at byte {at} has cut window "
                     f"{window[0]}..{window[1]} for length {length}; refusing to write "
