@@ -107,6 +107,8 @@ def test_add_effect_refuses_unproved_plugin_and_nonempty_slot(tmp_path):
 
     with pytest.raises(flp.FlpError, match="no FL-authored native default-state reference"):
         flp.add_effect(path, 0, "Fruity Reeverb 2")
+    with pytest.raises(flp.FlpError, match="Master insert 0"):
+        flp.add_effect(path, 1, "Fruity Parametric EQ 2")
     flp.add_effect(path, 0, "Fruity Parametric EQ 2")
     with pytest.raises(flp.FlpError, match="empty slot 0"):
         flp.add_effect(path, 0, "Fruity Parametric EQ 2")
