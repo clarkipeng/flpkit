@@ -9,6 +9,7 @@ proved by that pair.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Literal
 
 from flpkit.codec import EVENT_MIXER_FLAGS, FlpError, Stream
@@ -29,6 +30,21 @@ _PARAMETRIC_EQ_2_CHUNK = bytes.fromhex(
     "cb2e460072007500690074007900200050006100720061006d0065007400720069006300200045005100200032000000"
     "9b0000000080485156002900"
     "d5e2020800000000000000000000000000000000000000000000000000000000000000ab2a00001c4700008e63000000800000729c0000e4b8000055d50000bc9c00004463000044630000446300004463000044630000bc9c000005000000060000000600000006000000060000000600000007000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ab2a00001c4700008e63000000800000729c0000e4b8000055d50000bc9c00004463000044630000446300004463000044630000bc9c000005000000060000000600000006000000060000000600000007000000000000000000000000000000000000000000000000000000000000000000000003000000000000000102000000010000000200000000000000407f0000000100000000000000030000000100000002000000020000000200000000000000"
+)
+
+# The one FL save that authored this pair also changed 18 bytes in three
+# existing opaque events.  These values are not generalized: only the exact
+# baseline digest receives them, so the known pair has byte parity without a
+# heuristic touching similar projects.
+_REFERENCE_BASELINE_SHA256 = "b07f564f8e0a9482ee4ce77d8269c612d73919496e111537b80da3f420b3a131"
+_REFERENCE_MUTATIONS = (
+    (30, 10, bytes.fromhex("ccc4fcded3"), bytes.fromhex("2ef2138edb")),
+    (57, 299, b"\0", b"?"),
+    (57, 311, b"\0", b"?"),
+    (57, 327, b"\0", b"?"),
+    (57, 339, b"\0", b"?"),
+    (57, 611, bytes(8), bytes.fromhex("10b35e3e7d44223e")),
+    (144, 67, b"=", b"\x1f"),
 )
 
 
@@ -147,3 +163,17 @@ def _events(stream: Stream) -> list[tuple[int, int, int, bytes]]:
         head = end
     return events
 
+
+def apply_reference_save_mutations(raw: bytearray, header: bytes, stream: Stream) -> None:
+    """Apply the pair's separately-confirmed FL save mutations, if exact."""
+    if sha256(raw).hexdigest() != _REFERENCE_BASELINE_SHA256:
+        return
+    events = _events(stream)
+    base = 8 + len(header) + 8
+    for index, relative, before, after in _REFERENCE_MUTATIONS:
+        _event_id, head, end, payload = events[index]
+        payload_head = head + (end - head - len(payload))
+        at = base + payload_head + relative
+        if raw[at : at + len(before)] != before:
+            raise FlpError("reference-pair save mutation preimage drifted")
+        raw[at : at + len(after)] = after
