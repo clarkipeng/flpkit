@@ -71,6 +71,7 @@ from .formats.effects import (
     PluginDatabase,
     PluginKind,
     PluginReference,
+    apply_reference_save_mutations,
 )
 from .formats.levels import LEVEL_MAX, PAN_CENTRE, VOLUME_DEFAULT, Levels
 from .formats.notes import (
@@ -471,6 +472,7 @@ def add_plugin(
         raise FlpError("plugin add is only FL-authored for Master insert 0")
     head = fmt.locate(decoded, target)
     chunk = fmt.encode(reference)
+    apply_reference_save_mutations(raw, header, decoded)
     base = 8 + len(header) + 8
     raw[base + head : base + head] = chunk
     codec._bump_fldt_length(raw, len(chunk))
