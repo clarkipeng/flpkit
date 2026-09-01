@@ -467,6 +467,8 @@ def add_plugin(
     fmt = EffectFormat()
     decoded = codec.Stream(stream, event_size_overrides)
     reference = database.reference(plugin_name, kind)
+    if target != 0:
+        raise FlpError("plugin add is only FL-authored for Master insert 0")
     head = fmt.locate(decoded, target)
     chunk = fmt.encode(reference)
     base = 8 + len(header) + 8
