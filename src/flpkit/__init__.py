@@ -57,13 +57,20 @@ from .detect import (
     PLAYLIST_TRACK_SPACE,
     _log_size_override_fallback,
 )
-from .formats import AutomationFormat, LevelsFormat, NotesFormat, PlaylistFormat, TempoFormat
+from .formats import AutomationFormat, EffectFormat, LevelsFormat, NotesFormat, PlaylistFormat, TempoFormat
 from .formats.automation import (
     AUTOMATION_TAIL_DEFAULT,
     CHANNEL_TYPE_AUTOMATION,
     AutomationPointLike,
     AutomationPointSpec,
     FlpAutomationPoint,
+)
+from .formats.effects import (
+    DEFAULT_PLUGIN_DATABASE,
+    Effect,
+    PluginDatabase,
+    PluginKind,
+    PluginReference,
 )
 from .formats.levels import LEVEL_MAX, PAN_CENTRE, VOLUME_DEFAULT, Levels
 from .formats.notes import (
@@ -429,6 +436,57 @@ def write_automation(
         event_size_overrides=event_size_overrides,
     )
     return len(saved)
+
+
+def effects_at(
+    path: Path, insert_index: int, *, event_size_overrides: Mapping[int, int] | None = None
+) -> list[Effect]:
+    """The decoded effect instances in one mixer insert of the saved file."""
+    _header, stream = _chunks(path.read_bytes())
+    return EffectFormat().decode(codec.Stream(stream, event_size_overrides), insert_index)
+
+
+def add_plugin(
+    path: Path,
+    target: int,
+    plugin_name: str,
+    kind: PluginKind,
+    *,
+    database: PluginDatabase = DEFAULT_PLUGIN_DATABASE,
+    event_size_overrides: Mapping[int, int] | None = None,
+) -> list[Effect]:
+    """Add a referenced mixer plugin, then reparse and verify its opaque bytes.
+
+    ``database`` supplies complete FL-authored records.  It deliberately has
+    no synthetic default-state fallback: absent native or VST references fail
+    before the file changes.  The currently proven placement remains empty
+    slot 0 of a mixer insert.
+    """
+    raw = bytearray(path.read_bytes())
+    header, stream = _chunks(bytes(raw))
+    fmt = EffectFormat()
+    decoded = codec.Stream(stream, event_size_overrides)
+    reference = database.reference(plugin_name, kind)
+    head = fmt.locate(decoded, target)
+    chunk = fmt.encode(reference)
+    base = 8 + len(header) + 8
+    raw[base + head : base + head] = chunk
+    codec._bump_fldt_length(raw, len(chunk))
+    path.write_bytes(bytes(raw))
+    saved = effects_at(path, target, event_size_overrides=event_size_overrides)
+    fmt.verify(reference, saved)
+    return saved
+
+
+def add_effect(
+    path: Path,
+    insert_index: int,
+    plugin_name: str,
+    *,
+    event_size_overrides: Mapping[int, int] | None = None,
+) -> list[Effect]:
+    """Compatibility name for adding a native mixer plugin."""
+    return add_plugin(path, insert_index, plugin_name, "native", event_size_overrides=event_size_overrides)
 
 
 def set_channel_levels(

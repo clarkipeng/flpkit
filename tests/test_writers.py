@@ -80,6 +80,54 @@ def test_set_tempo_readback_is_the_stored_quantized_value(tmp_path):
     assert stored == round(128.5004 * 1000) / 1000
 
 
+# -- add_effect ---------------------------------------------------------------
+
+
+def mixer_insert(index: int, *events: bytes) -> bytes:
+    return event(236, struct.pack("<III", index, 12, 0)) + b"".join(events)
+
+
+def test_add_effect_splices_the_confirmed_eq2_chunk_and_reparses(tmp_path):
+    empty_slot_zero = event(98, b"\0\0")
+    slot_one = event(98, b"\1\0")
+    path = write_flp(tmp_path, VERSION_MODERN + mixer_insert(0, empty_slot_zero, slot_one))
+    before = path.read_bytes()
+
+    saved = flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+
+    assert [effect.name for effect in saved] == ["Fruity Parametric EQ 2"]
+    assert path.read_bytes()[len(before) - len(slot_one) : -len(slot_one)] == saved[0].chunk
+    assert flp.effects_at(path, 0) == saved
+
+
+def test_add_effect_refuses_unproved_plugin_and_nonempty_slot(tmp_path):
+    path = write_flp(
+        tmp_path, VERSION_MODERN + mixer_insert(0, event(98, b"\0\0"), event(98, b"\1\0"))
+    )
+
+    with pytest.raises(flp.FlpError, match="no FL-authored native default-state reference"):
+        flp.add_effect(path, 0, "Fruity Reeverb 2")
+    flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+    with pytest.raises(flp.FlpError, match="empty slot 0"):
+        flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+
+
+def test_add_plugin_reads_opaque_references_by_kind_without_a_plugin_specific_wrapper(tmp_path):
+    path = write_flp(
+        tmp_path, VERSION_MODERN + mixer_insert(0, event(98, b"\0\0"), event(98, b"\1\0"))
+    )
+    # Synthetic database injection proves that the writer does not branch on
+    # kind. It is not an FL claim that this native chunk is a VST default.
+    reference = flp.PluginReference("Fruity Parametric EQ 2", "vst", flp.DEFAULT_PLUGIN_DATABASE.references[0].chunk)
+    database = flp.PluginDatabase((reference,))
+
+    saved = flp.add_plugin(path, 0, reference.name, "vst", database=database)
+
+    assert [(effect.name, effect.chunk) for effect in saved] == [(reference.name, reference.chunk)]
+    with pytest.raises(flp.FlpError, match="no FL-authored vst default-state reference"):
+        flp.add_plugin(path, 0, reference.name, "vst")
+
+
 # The v1 byte-identity differential (test_set_tempo_byte_identical_to_v1_port_source)
 # lived here until the cutover. It asserted that v2's set_tempo wrote the same bytes
 # as v1's flp_writer.set_tempo for both the mutate and append paths, and it PASSED -
