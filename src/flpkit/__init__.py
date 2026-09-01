@@ -69,7 +69,6 @@ from .formats.effects import (
     DEFAULT_PLUGIN_DATABASE,
     Effect,
     PluginDatabase,
-    PluginKind,
     PluginReference,
     apply_reference_save_mutations,
 )
@@ -447,50 +446,37 @@ def effects_at(
     return EffectFormat().decode(codec.Stream(stream, event_size_overrides), insert_index)
 
 
-def add_plugin(
+def add_effect(
     path: Path,
-    target: int,
+    insert_index: int,
     plugin_name: str,
-    kind: PluginKind,
     *,
     database: PluginDatabase = DEFAULT_PLUGIN_DATABASE,
     event_size_overrides: Mapping[int, int] | None = None,
 ) -> list[Effect]:
-    """Add a referenced mixer plugin, then reparse and verify its opaque bytes.
+    """Add an FL-authored effect reference, then reparse and verify it.
 
-    ``database`` supplies complete FL-authored records.  It deliberately has
-    no synthetic default-state fallback: absent native or VST references fail
-    before the file changes.  The currently proven placement remains empty
-    slot 0 of a mixer insert.
+    Only the registry's Fruity Parametric EQ 2 reference on Master insert 0,
+    empty slot 0 is proven.  Unknown names and every other placement refuse
+    before the file changes.
     """
     raw = bytearray(path.read_bytes())
     header, stream = _chunks(bytes(raw))
     fmt = EffectFormat()
     decoded = codec.Stream(stream, event_size_overrides)
-    reference = database.reference(plugin_name, kind)
-    if target != 0:
-        raise FlpError("plugin add is only FL-authored for Master insert 0")
-    head = fmt.locate(decoded, target)
+    reference = database.reference(plugin_name)
+    if insert_index != 0:
+        raise FlpError("effect add is only FL-authored for Master insert 0")
+    head = fmt.locate(decoded, insert_index)
     chunk = fmt.encode(reference)
     apply_reference_save_mutations(raw, header, decoded)
     base = 8 + len(header) + 8
     raw[base + head : base + head] = chunk
     codec._bump_fldt_length(raw, len(chunk))
     path.write_bytes(bytes(raw))
-    saved = effects_at(path, target, event_size_overrides=event_size_overrides)
+    saved = effects_at(path, insert_index, event_size_overrides=event_size_overrides)
     fmt.verify(reference, saved)
     return saved
-
-
-def add_effect(
-    path: Path,
-    insert_index: int,
-    plugin_name: str,
-    *,
-    event_size_overrides: Mapping[int, int] | None = None,
-) -> list[Effect]:
-    """Compatibility name for adding a native mixer plugin."""
-    return add_plugin(path, insert_index, plugin_name, "native", event_size_overrides=event_size_overrides)
 
 
 def set_channel_levels(

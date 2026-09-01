@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Literal
 
 from flpkit.codec import EVENT_MIXER_FLAGS, FlpError, Stream
 
@@ -19,7 +18,6 @@ _WRAPPER = 212
 _USER_NAME = 203
 _STATE = 213
 _SLOT = 98
-PluginKind = Literal["native", "vst"]
 
 # FL 26.1.5, authored 2026-09-01: Empty master slot 0 -> add Fruity
 # Parametric EQ 2 -> save.  This is the complete event framing, not a
@@ -50,10 +48,9 @@ _REFERENCE_MUTATIONS = (
 
 @dataclass(frozen=True)
 class PluginReference:
-    """One FL-authored opaque plugin record, indexed by identity and kind."""
+    """One FL-authored opaque effect record."""
 
     name: str
-    kind: PluginKind
     chunk: bytes
 
 
@@ -63,11 +60,11 @@ class PluginDatabase:
 
     references: tuple[PluginReference, ...]
 
-    def reference(self, name: str, kind: PluginKind) -> PluginReference:
+    def reference(self, name: str) -> PluginReference:
         for reference in self.references:
-            if reference.name == name and reference.kind == kind:
+            if reference.name == name:
                 return reference
-        raise FlpError(f"no FL-authored {kind} default-state reference for plugin {name!r}")
+        raise FlpError(f"no FL-authored default-state reference for effect {name!r}")
 
 
 @dataclass(frozen=True)
@@ -79,7 +76,7 @@ class Effect:
 
 
 DEFAULT_PLUGIN_DATABASE = PluginDatabase(
-    (PluginReference("Fruity Parametric EQ 2", "native", _PARAMETRIC_EQ_2_CHUNK),)
+    (PluginReference("Fruity Parametric EQ 2", _PARAMETRIC_EQ_2_CHUNK),)
 )
 
 
