@@ -1,8 +1,6 @@
 """flpkit writer tests: raw byte surgery, verified by re-reading the file.
 
-set_tempo was a PORT of the live-verified v1 (flp_writer.set_tempo, commit
-13f8afc): the byte-differential test below asserts both produce identical
-files, so any byte-level drift in the port fails loudly.
+Writer tests exercise the public shims and the generic Format codec.
 """
 
 from __future__ import annotations
@@ -68,10 +66,11 @@ def test_set_tempo_appends_at_end_of_stream_when_absent(tmp_path):
     assert flp.read(path).tempo == 133.0
 
 
-def test_set_tempo_rejects_out_of_range():
+def test_set_tempo_rejects_out_of_range(tmp_path):
+    path = write_flp(tmp_path, VERSION_MODERN)
     for bpm in (9.9, 999.1, 0, -10):
-        with pytest.raises(ValueError, match="out of range"):
-            flp.set_tempo(Path("/nonexistent.flp"), bpm)
+        with pytest.raises(flp.FlpError, match="out of range"):
+            flp.set_tempo(path, bpm)
 
 
 def test_set_tempo_readback_is_the_stored_quantized_value(tmp_path):
@@ -80,14 +79,98 @@ def test_set_tempo_readback_is_the_stored_quantized_value(tmp_path):
     assert stored == round(128.5004 * 1000) / 1000
 
 
-# The v1 byte-identity differential (test_set_tempo_byte_identical_to_v1_port_source)
-# lived here until the cutover. It asserted that v2's set_tempo wrote the same bytes
-# as v1's flp_writer.set_tempo for both the mutate and append paths, and it PASSED -
-# which is what licensed deleting v1. It cannot be re-run now that flp_writer is gone,
-# and re-freezing v2's own output as a golden would only assert v2 == v2, so it is
-# retired rather than faked. The live gate (tests/test_flp_live.py) is what guards
-# set_tempo from here on: FL itself reports the tempo back.
+# -- add_effect ---------------------------------------------------------------
 
+
+def mixer_insert(index: int, *events: bytes) -> bytes:
+    return event(236, struct.pack("<III", index, 12, 0)) + b"".join(events)
+
+
+def test_add_effect_splices_the_confirmed_eq2_chunk_and_reparses(tmp_path):
+    empty_slot_zero = event(98, b"\0\0")
+    slot_one = event(98, b"\1\0")
+    path = write_flp(tmp_path, VERSION_MODERN + mixer_insert(0, empty_slot_zero, slot_one))
+    before = path.read_bytes()
+    _header, before_stream = flp._chunks(before)
+
+    saved = flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+
+    assert [effect.name for effect in saved] == ["Fruity Parametric EQ 2"]
+    assert flp.effects_at(path, 0) == saved
+    _header, after_stream = flp._chunks(path.read_bytes())
+    splice_at = len(before_stream) - len(slot_one)
+    assert after_stream[:splice_at] == before_stream[:splice_at]
+    assert after_stream[splice_at + len(saved[0].chunk) :] == before_stream[splice_at:]
+
+
+def test_codec_patch_validates_mode_and_format_inputs(tmp_path):
+    notes = write_flp(tmp_path, VERSION_MODERN)
+    before = notes.read_bytes()
+    with pytest.raises(flp.FlpError, match="patch mode"):
+        flp.codec.patch(
+            notes, flp.NotesFormat(), flp.Target(pattern=1, channel=0), [], "append"  # type: ignore[arg-type]
+        )
+    for note in (
+        Note(key=128, start=0.0, length=1.0),
+        Note(key=60, start=-1.0, length=1.0),
+        Note(key=60, start=0.0, length=-1.0),
+        Note(key=60, start=0.0, length=1.0, velocity=1.1),
+        Note(key=60, start=0.0, length=1.0, pan=-0.1),
+    ):
+        with pytest.raises(flp.FlpError):
+            flp.codec.patch(notes, flp.NotesFormat(), flp.Target(pattern=1, channel=0), [note], "replace")
+    assert notes.read_bytes() == before
+
+    levels = write_flp(tmp_path, VERSION_MODERN + channel_with_levels(0))
+    for item in (
+        flp.Levels(volume=1.1, pan=0.0, pitch_semitones=0),
+        flp.Levels(volume=0.5, pan=-1.1, pitch_semitones=0),
+        flp.Levels(volume=0.5, pan=0.0, pitch_semitones=49),
+    ):
+        with pytest.raises(flp.FlpError):
+            flp.codec.patch(levels, flp.LevelsFormat(), flp.Target(channel=0), [item], "replace")
+    with pytest.raises(flp.FlpError, match="tempo"):
+        flp.codec.patch(notes, flp.TempoFormat(), flp.Target(), [1.0], "replace")
+
+
+def test_add_effect_refuses_unproved_plugin_and_nonempty_slot(tmp_path):
+    path = write_flp(
+        tmp_path, VERSION_MODERN + mixer_insert(0, event(98, b"\0\0"), event(98, b"\1\0"))
+    )
+
+    with pytest.raises(flp.FlpError, match="no FL-authored default-state reference"):
+        flp.add_effect(path, 0, "Fruity Reeverb 2")
+    with pytest.raises(flp.FlpError, match="Master insert 0"):
+        flp.add_effect(path, 1, "Fruity Parametric EQ 2")
+    flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+    with pytest.raises(flp.FlpError, match="empty slot 0"):
+        flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+
+
+def test_effect_format_rejects_missing_insert_as_flp_error(tmp_path):
+    path = write_flp(tmp_path, VERSION_MODERN)
+
+    with pytest.raises(flp.FlpError, match="no mixer insert 0"):
+        flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+
+
+def test_effects_at_wraps_malformed_utf16_as_flp_error(tmp_path):
+    reference = flp.DEFAULT_PLUGIN_DATABASE.reference("Fruity Parametric EQ 2")
+    malformed = bytearray(reference.chunk)
+    malformed[1] -= 1
+    del malformed[47]  # make the InternalName UTF-16 payload odd-length
+    path = write_flp(
+        tmp_path,
+        VERSION_MODERN + mixer_insert(0, event(98, b"\0\0"), bytes(malformed), event(98, b"\1\0")),
+    )
+
+    with pytest.raises(flp.FlpError, match="UTF-16"):
+        flp.effects_at(path, 0)
+
+
+def test_codec_read_absent_tempo_is_empty(tmp_path):
+    path = write_flp(tmp_path, VERSION_MODERN)
+    assert flp.codec.read(path, flp.TempoFormat(), flp.Target()) == []
 
 # -- write_notes --------------------------------------------------------------
 

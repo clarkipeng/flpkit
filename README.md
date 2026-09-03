@@ -40,8 +40,9 @@ Every writer then **verifies itself**: it re-reads the saved file and field-matc
 - `set_channel_levels` - patches pan/volume/pitch int32s inside the channel's `Levels` event; refuses legacy files rather than writing guessed units
 - `write_playlist` - splices pattern clips into an arrangement's playlist event; every new record is built from the first EXISTING record as a byte template (so the era-specific tail carries FL's own defaults), kept position-sorted the way FL writes them. Live-verified: FL Studio 2026 loads the written clips (song length grows to match) and its OWN re-save round-trips them byte-identically
 - `write_automation` - replaces the points inside an EXISTING automation channel's blob; the 17-byte header and the opaque era trailer are carried verbatim, absolute positions convert back to FL's stored x-deltas, and each point's opaque 4-byte tail rides along.
-  Feeding a channel's decoded points straight back rewrites its blob byte-identically (verified across all 1,100 corpus blobs).
+  Feeding a channel's decoded points straight back is readback-identical; it is byte-identical for FL-authored blobs in corpus tests.
   Creating a NEW clip is out of scope until the link bytes are decoded - a non-automation channel or a missing blob is an error, not an invitation to fabricate
+- `add_effect` and `effects_at` - splice and read captured mixer-effect references while preserving plugin state as opaque data
 
 ## One engine, formats as data (0.6.0)
 
@@ -56,7 +57,7 @@ codec.patch(path, NotesFormat(), codec.Target(pattern=1, channel=0), notes, mode
 ```
 
 A `Format` (see `flpkit/formats/`) states one `.flp` element - `locate`, `encode`, `decode`, `verify` - and the engine does the rest: splice, chunk-length fixing, and verify-by-readback live in `codec.patch`, once.
-Reading `formats/notes.py` plus `codec.py` tells you everything about how notes work; the same goes for playlist, automation, levels, and tempo.
+Reading `formats/notes.py` plus `codec.py` tells you everything about how notes work; the same goes for playlist, automation, levels, tempo, and effects.
 The public functions (`write_notes`, `set_tempo`, ...) are thin shims over `codec.patch`, and `tests/test_differential.py` proves the codec writes byte-identical output to the pre-0.6.0 hand-rolled writers.
 
 ## Detect, don't assume
@@ -65,7 +66,7 @@ Format constants are DETECTED from the file itself wherever the data carries an 
 
 - The playlist record stride is detected per blob (the constant `pattern_base` signature), never taken from a version table.
 - The note-flags word is templated from the target file's own notes; the corpus-surveyed `0x4000` covers files with none.
-- The playlist cut window (bytes 24-31) is only written when every existing record in the file exhibits the verified `0..length` relation; otherwise the write refuses.
+- New playlist records inherit their cut-window bytes from an existing record; existing era-specific windows remain opaque.
 - Event-size overrides (event 172 is one byte on FL 2026, not the classic four) are an `event_size_overrides` argument on every public function, so a capability profile can supply a measured table for other FL versions; the built-in FL-2026 table is the once-logged fallback.
 
 ## How it was verified
@@ -80,9 +81,13 @@ One example of why the live half matters: a note-record flags field of `0` parse
 
 ## Scope, honestly
 
-flpkit models what a composition agent needs: tempo, channels, levels, notes.
-It does not (yet) decode plugin state or the mixer graph - those events pass through writes untouched, but `read()` does not expose them. Playlist reading landed in 0.2.0, automation-clip reading in 0.3.0, playlist writing in 0.4.0 (FL-2026 live-verified), automation-point writing in 0.5.0 (corpus-verified byte-identical; live FL round-trip pending).
+flpkit models what a composition agent needs: tempo, channels, levels, notes, and captured mixer-effect references.
+It does not decode plugin state or the mixer graph: plugin tuples are captured and spliced as opaque data, while `read()` does not expose a mixer graph. Playlist reading landed in 0.2.0, automation-clip reading in 0.3.0, playlist writing in 0.4.0 (FL-2026 live-verified), automation-point writing in 0.5.0 (readback-identical; byte-identical for FL-authored corpus blobs; live FL round-trip pending).
 Automation clip CREATION (a new curve on a new target) stays out until the target-link bytes are decoded by live minimal-pair experiments.
+
+## Captured plugin references
+
+Plugin references live in `src/flpkit/data/plugins/`. The index maps a plugin name to one JSON record. Each record has `name`, `fl_build`, `kind`, `chunk_hex`, `sha256`, and `captured_on`. Capture pipelines should write that record from an FL-authored plugin tuple, hash the decoded `chunk_hex`, and add its name to the index. flpkit validates the hash before it splices the opaque tuple.
 
 ## Bring your own note type
 

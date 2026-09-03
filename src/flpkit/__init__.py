@@ -12,7 +12,7 @@ flpkit is a small, dependency-free library for the undocumented FLP format:
   write patches exactly the bytes that express the change, never more.
 
 Each element type is a Format spec under ``formats/`` (notes, playlist,
-automation, levels, tempo): reading one module tells you everything about
+automation, levels, tempo, effects): reading one module tells you everything about
 that element. Every constant is a reverse-engineered fact carrying its
 evidence, verified against real FL Studio 2026 (macOS) and a corpus of 164
 FL-authored projects; the live verification harness lives in the parent
@@ -25,6 +25,7 @@ import logging
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 
 # ruff: noqa: F401
@@ -57,13 +58,19 @@ from .detect import (
     PLAYLIST_TRACK_SPACE,
     _log_size_override_fallback,
 )
-from .formats import AutomationFormat, LevelsFormat, NotesFormat, PlaylistFormat, TempoFormat
+from .formats import AutomationFormat, EffectFormat, LevelsFormat, NotesFormat, PlaylistFormat, TempoFormat
 from .formats.automation import (
     AUTOMATION_TAIL_DEFAULT,
     CHANNEL_TYPE_AUTOMATION,
     AutomationPointLike,
     AutomationPointSpec,
     FlpAutomationPoint,
+)
+from .formats.effects import (
+    DEFAULT_PLUGIN_DATABASE,
+    Effect,
+    PluginDatabase,
+    PluginReference,
 )
 from .formats.levels import LEVEL_MAX, PAN_CENTRE, VOLUME_DEFAULT, Levels
 from .formats.notes import (
@@ -88,6 +95,7 @@ log = logging.getLogger("flpkit")
 NoteWriteMode = Mode
 EVENT_VERSION = 199  # ascii "major.minor..."; >= 11.5 -> text events are UTF-16-LE
 PPQ_DEFAULT = 96
+__version__ = version("flpkit")
 
 
 def _events(stream, event_size_overrides: Mapping[int, int] | None = None):
@@ -420,15 +428,47 @@ def write_automation(
 ) -> int:
     """Replace the points inside an EXISTING automation channel's blob (see
     formats/automation.py); return the number of points the saved file holds.
-    Feeding a channel's decoded points straight back rewrites its blob
-    byte-identically (verified across all 1,100 corpus blobs)."""
+    Feeding a channel's decoded points straight back is readback-identical;
+    FL-authored blobs are byte-identical in corpus tests."""
     if mode != "replace":
-        raise ValueError(f"unsupported mode {mode!r}; write_automation only replaces")
+        raise FlpError(f"unsupported mode {mode!r}; write_automation only replaces")
     saved = codec.patch(
         path, AutomationFormat(), Target(channel=channel), points, mode,
         event_size_overrides=event_size_overrides,
     )
     return len(saved)
+
+
+def effects_at(
+    path: Path, insert_index: int, *, event_size_overrides: Mapping[int, int] | None = None
+) -> list[Effect]:
+    """The decoded effect instances in one mixer insert of the saved file."""
+    return codec.read(
+        path, EffectFormat(), Target(insert=insert_index), event_size_overrides=event_size_overrides
+    )
+
+
+def add_effect(
+    path: Path,
+    insert_index: int,
+    plugin_name: str,
+    *,
+    database: PluginDatabase = DEFAULT_PLUGIN_DATABASE,
+    event_size_overrides: Mapping[int, int] | None = None,
+) -> list[Effect]:
+    """Add an FL-authored effect reference, then reparse and verify it.
+
+    Only the registry's Fruity Parametric EQ 2 reference on Master insert 0,
+    empty slot 0 is proven.  Unknown names and every other placement refuse
+    before the file changes.
+    """
+    if insert_index != 0:
+        raise FlpError("effect add is only FL-authored for Master insert 0")
+    reference = database.reference(plugin_name)
+    return codec.patch(
+        path, EffectFormat(adding=True), Target(insert=insert_index), [reference], "replace",
+        event_size_overrides=event_size_overrides,
+    )
 
 
 def set_channel_levels(
@@ -443,13 +483,6 @@ def set_channel_levels(
     """Patch the channel's levels; None leaves a value alone (filled from the
     file's current Levels, so untouched fields rewrite byte-identically).
     Returns the readback. See formats/levels.py for the layout and refusals."""
-    if volume is not None and not 0.0 <= volume <= 1.0:
-        raise ValueError(f"volume {volume} out of range (0.0-1.0)")
-    if pan is not None and not -1.0 <= pan <= 1.0:
-        raise ValueError(f"pan {pan} out of range (-1.0 left to 1.0 right)")
-    if pitch_semitones is not None and not -48 <= pitch_semitones <= 48:
-        raise ValueError(f"pitch {pitch_semitones} out of range (-48 to 48)")
-
     fmt, target = LevelsFormat(), Target(channel=channel)
     (current,) = codec.read(path, fmt, target, event_size_overrides=event_size_overrides)
     merged = Levels(
@@ -472,8 +505,6 @@ def set_tempo(
 ) -> float:
     """Patch the tempo event in place, or APPEND one at the end of the event
     stream when FL omitted it (see formats/tempo.py). Returns the readback."""
-    if not 10.0 <= bpm <= 999.0:
-        raise ValueError(f"tempo {bpm} out of range (10-999 BPM)")
     (stored,) = codec.patch(
         path, TempoFormat(), Target(), [bpm], "replace",
         event_size_overrides=event_size_overrides,

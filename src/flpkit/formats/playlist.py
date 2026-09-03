@@ -70,6 +70,7 @@ class Clip:
 class PlaylistFormat:
     name = "playlist"
     event_id = EVENT_PLAYLIST
+    frame = None
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
         """The target arrangement's playlist event (arrangement events switch
