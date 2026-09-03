@@ -1,10 +1,11 @@
 [project]
 name = "flpkit"
-version = "0.7.2"
+version = "0.8.0"
 description = "Read and write FL Studio .flp project files - a small, dependency-free library for the undocumented FLP format, with self-verifying raw-surgery writers"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
+dependencies = []
 authors = [{ name = "Origami Research" }]
 keywords = ["fl-studio", "flp", "daw", "midi", "music"]
 classifiers = [

@@ -12,6 +12,6 @@ from .tempo import TempoFormat
 # Every Format this library ships, for generic iteration (e.g. round-trip
 # suites). Classes, not instances: a Format instance is call-scoped (its
 # locate captures in-file templates), so construct one per use.
-ALL = (NotesFormat, PlaylistFormat, AutomationFormat, LevelsFormat, TempoFormat)
+ALL = (NotesFormat, PlaylistFormat, AutomationFormat, LevelsFormat, TempoFormat, EffectFormat)
 
 __all__ = ["ALL", "AutomationFormat", "EffectFormat", "LevelsFormat", "NotesFormat", "PlaylistFormat", "TempoFormat"]

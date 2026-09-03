@@ -1,6 +1,6 @@
 """The ONE read+write engine over the FLP event stream.
 
-A .flp element type (notes, playlist, automation, levels, tempo) implements
+A .flp element type (notes, playlist, automation, levels, tempo, effects) implements
 the ``Format`` protocol; :func:`read` and :func:`patch` are the only paths
 that touch the file. All the messy splice and chunk-length math lives here,
 once. Writes are raw byte surgery - patch exactly the bytes that express the
@@ -58,6 +58,7 @@ class Target:
     pattern: int | None = None
     channel: int | None = None
     arrangement: int | None = None
+    insert: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,7 @@ class Format(Protocol):
     first and may capture in-file templates (a flags word, a record template,
     a header/trailer) that ``encode`` then carries (detect-don't-assume)."""
 
-    name: str  # "notes", "playlist", "automation", "levels", "tempo"
+    name: str  # "notes", "playlist", "automation", "levels", "tempo", "effects"
     event_id: int  # the FLP event that carries it
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
@@ -104,7 +105,6 @@ class Format(Protocol):
     def verify(self, sent: Sequence[Any], readback: Sequence[Any]) -> None:
         """Raise FlpError unless the saved file decodes to exactly ``sent``."""
         ...
-
 
 def read(
     path: Path,
@@ -135,6 +135,9 @@ def patch(
     ``data``; the readback IS the contract - the saved file must decode to
     exactly what was spliced, or FlpError. Returns the target-scoped readback.
     """
+    if mode not in ("merge", "replace"):
+        raise FlpError(f"unsupported patch mode {mode!r}; expected 'merge' or 'replace'")
+
     raw = bytearray(path.read_bytes())
     header, ppq, stream = _open(bytes(raw), event_size_overrides)
     base = 8 + len(header) + 8  # the FLdt payload's file offset
@@ -144,7 +147,8 @@ def patch(
     kept = fmt.decode(kept_blob, ppq) if kept_blob else []
     payload = fmt.encode([*kept, *data], ppq)
 
-    event = site.prelude + frame_event(fmt.event_id, payload)
+    frame = getattr(fmt, "frame", None)
+    event = site.prelude + (frame(payload) if frame is not None else frame_event(fmt.event_id, payload))
     raw[base + site.head : base + site.end] = event
     _bump_fldt_length(raw, len(event) - (site.end - site.head))
     path.write_bytes(bytes(raw))

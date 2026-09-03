@@ -65,6 +65,12 @@ class LevelsFormat:
         if len(data) != 1:
             raise FlpError(f"a channel has exactly one Levels, got {len(data)}")
         (levels,) = data
+        if not 0 <= levels.volume <= 1:
+            raise FlpError(f"volume {levels.volume} out of range (0.0-1.0)")
+        if not -1 <= levels.pan <= 1:
+            raise FlpError(f"pan {levels.pan} out of range (-1.0 to 1.0)")
+        if not -48 <= levels.pitch_semitones <= 48:
+            raise FlpError(f"pitch {levels.pitch_semitones} out of range (-48 to 48)")
         return (
             struct.pack(
                 "<iIi",

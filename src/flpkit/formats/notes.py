@@ -12,7 +12,7 @@ import logging
 import struct
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from flpkit.codec import (
@@ -91,6 +91,7 @@ class Note(NoteSpec):
     midi_channel: int = 0
     mod_x: int = MOD_DEFAULT
     mod_y: int = MOD_DEFAULT
+    raw_values: bool = field(default=False, repr=False, compare=False)
 
 
 class NotesFormat:
@@ -164,6 +165,15 @@ class NotesFormat:
             log.debug("no existing notes to template flags from; using the corpus default 0x%04x", flags)
         packed = bytearray()
         for note in data:
+            if not 0 <= note.key <= 127:
+                raise FlpError(f"note key {note.key} out of range (0-127)")
+            if note.start < 0 or note.length < 0:
+                raise FlpError("note start and length must be non-negative")
+            # Decoded records carry raw values FL may itself place outside the
+            # public tool range. Preserve those opaque facts byte-for-byte.
+            raw_values = getattr(note, "raw_values", False)
+            if not raw_values and (not 0 <= note.velocity <= 1 or not 0 <= note.pan <= 1):
+                raise FlpError("note velocity and pan must be in range 0.0-1.0")
             packed += NOTE_STRUCT.pack(
                 round(note.start * ppq),
                 getattr(note, "flags", flags),
@@ -178,8 +188,8 @@ class NotesFormat:
                 getattr(note, "u1", 0),
                 getattr(note, "release", RELEASE_DEFAULT),
                 getattr(note, "midi_channel", 0),
-                min(255, max(0, round(note.pan * 128))),
-                min(255, max(0, round(note.velocity * 127))),
+                round(note.pan * 128),
+                round(note.velocity * 127),
                 getattr(note, "mod_x", MOD_DEFAULT),
                 getattr(note, "mod_y", MOD_DEFAULT),
             )
@@ -196,7 +206,7 @@ class NotesFormat:
                 key=key, start=position / ppq, length=length / ppq,
                 velocity=velocity / 127, pan=pan / 128,
                 channel=channel, flags=flags, group=group, fine_pitch=fine_pitch,
-                u1=u1, release=release, midi_channel=midi_channel, mod_x=mod_x, mod_y=mod_y,
+                u1=u1, release=release, midi_channel=midi_channel, mod_x=mod_x, mod_y=mod_y, raw_values=True,
             )
             for (
                 position, flags, channel, length, key, group,

@@ -1,157 +1,148 @@
-"""The one confirmed mixer-effect add: Parametric EQ 2 on an empty master slot.
-
-The FL-authored minimal pair establishes this exact 519-byte chunk.  The
-plugin state is opaque, so this format deliberately exposes no general plugin
-encoder: callers get a refusal for every name, insert, or slot shape not
-proved by that pair.
-"""
+"""Captured mixer-effect references, spliced without interpreting plugin state."""
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
+from importlib.resources import files
 
-from flpkit.codec import EVENT_MIXER_FLAGS, FlpError, Stream
+from flpkit.codec import EVENT_MIXER_FLAGS, FlpError, SpliceSite, Stream, Target, verify_identical
 
 _INTERNAL_NAME = 201
 _WRAPPER = 212
-_USER_NAME = 203
 _STATE = 213
 _SLOT = 98
-
-# FL 26.1.5, authored 2026-09-01: Empty master slot 0 -> add Fruity
-# Parametric EQ 2 -> save.  This is the complete event framing, not a
-# synthesized plugin state.
-_PARAMETRIC_EQ_2_CHUNK = bytes.fromhex(
-    "c92e460072007500690074007900200050006100720061006d0065007400720069006300200045005100200032000000"
-    "d434000000000100000002000000000000004001000000000000000000000000000000000000540000007e000000bc0200005e010000"
-    "cb2e460072007500690074007900200050006100720061006d0065007400720069006300200045005100200032000000"
-    "9b0000000080485156002900"
-    "d5e2020800000000000000000000000000000000000000000000000000000000000000ab2a00001c4700008e63000000800000729c0000e4b8000055d50000bc9c00004463000044630000446300004463000044630000bc9c000005000000060000000600000006000000060000000600000007000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ab2a00001c4700008e63000000800000729c0000e4b8000055d50000bc9c00004463000044630000446300004463000044630000bc9c000005000000060000000600000006000000060000000600000007000000000000000000000000000000000000000000000000000000000000000000000003000000000000000102000000010000000200000000000000407f0000000100000000000000030000000100000002000000020000000200000000000000"
-)
-
-# The one FL save that authored this pair also changed 18 bytes in three
-# existing opaque events.  These values are not generalized: only the exact
-# baseline digest receives them, so the known pair has byte parity without a
-# heuristic touching similar projects.
-_REFERENCE_BASELINE_SHA256 = "b07f564f8e0a9482ee4ce77d8269c612d73919496e111537b80da3f420b3a131"
-_REFERENCE_MUTATIONS = (
-    (30, 10, bytes.fromhex("ccc4fcded3"), bytes.fromhex("2ef2138edb")),
-    (57, 299, b"\0", b"?"),
-    (57, 311, b"\0", b"?"),
-    (57, 327, b"\0", b"?"),
-    (57, 339, b"\0", b"?"),
-    (57, 611, bytes(8), bytes.fromhex("10b35e3e7d44223e")),
-    (144, 67, b"=", b"\x1f"),
-)
+_RESOURCE_DIR = ("data", "plugins")
 
 
 @dataclass(frozen=True)
 class PluginReference:
-    """One FL-authored opaque effect record."""
+    """One FL-authored opaque plugin tuple captured as data."""
 
     name: str
     chunk: bytes
+    fl_build: str
+    kind: str
 
 
-@dataclass(frozen=True)
 class PluginDatabase:
-    """The only source of plugin bytes; a missing reference is an honest refusal."""
+    """Lazy captured-reference lookup, indexed by plugin name."""
 
-    references: tuple[PluginReference, ...]
+    def __init__(self, references: Mapping[str, PluginReference] | None = None):
+        self._references = dict(references or {})
+        self._index: dict[str, str] | None = {} if references is not None else None
 
     def reference(self, name: str) -> PluginReference:
-        for reference in self.references:
-            if reference.name == name:
-                return reference
-        raise FlpError(f"no FL-authored default-state reference for effect {name!r}")
+        if name in self._references:
+            return self._references[name]
+        if self._index is None:
+            root = files("flpkit").joinpath(*_RESOURCE_DIR)
+            self._index = json.loads(root.joinpath("index.json").read_text())
+        filename = self._index.get(name)
+        if filename is None:
+            raise FlpError(f"no FL-authored default-state reference for effect {name!r}")
+        record = json.loads(files("flpkit").joinpath(*_RESOURCE_DIR, filename).read_text())
+        try:
+            chunk = bytes.fromhex(record["chunk_hex"])
+            reference = PluginReference(record["name"], chunk, record["fl_build"], record["kind"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise FlpError(f"invalid captured plugin reference {filename!r}") from error
+        if reference.name != name or sha256(chunk).hexdigest() != record.get("sha256"):
+            raise FlpError(f"captured plugin reference {filename!r} failed its integrity check")
+        self._references[name] = reference
+        return reference
 
 
 @dataclass(frozen=True)
 class Effect:
-    """A confirmed mixer-effect instance; state stays opaque and byte-faithful."""
+    """A decoded effect tuple whose plugin state remains opaque."""
 
     name: str
     chunk: bytes
 
 
-DEFAULT_PLUGIN_DATABASE = PluginDatabase(
-    (PluginReference("Fruity Parametric EQ 2", _PARAMETRIC_EQ_2_CHUNK),)
-)
+DEFAULT_PLUGIN_DATABASE = PluginDatabase()
 
 
 class EffectFormat:
-    """Locate, encode, decode, and verify the one FL-authored add-effect rule."""
+    """The proven empty Master slot 0 insertion, expressed as a Format."""
 
-    def locate(self, stream: Stream, insert_index: int) -> int:
-        """Return the empty slot-0 insertion head for the named mixer insert.
+    name = "effects"
+    event_id = _INTERNAL_NAME
 
-        Insert ids are carried in the first u32 of event 236.  Only an empty
-        slot zero is proven: its marker must precede slot one with no plugin
-        tuple between them.  Anything else is a different format rule.
-        """
+    def __init__(self, *, adding: bool = False):
+        self._adding = adding
+
+    def locate(self, stream: Stream, target: Target) -> SpliceSite:
+        if target.insert != 0:
+            raise FlpError("effect add is only FL-authored for Master insert 0")
         events = _events(stream)
-        target = next(
+        insert = next(
             (
                 index
                 for index, (event_id, _head, _end, payload) in enumerate(events)
                 if event_id == EVENT_MIXER_FLAGS and len(payload) == 12
-                and int.from_bytes(payload[:4], "little") == insert_index
+                and int.from_bytes(payload[:4], "little") == target.insert
             ),
             None,
         )
-        if target is None:
-            raise IndexError(f"no mixer insert {insert_index}")
-        for index, (event_id, head, _end, payload) in enumerate(events[target + 1 :], target + 1):
+        if insert is None:
+            raise IndexError(f"no mixer insert {target.insert}")
+        for index, (event_id, _head, _end, payload) in enumerate(events[insert + 1 :], insert + 1):
             if event_id == EVENT_MIXER_FLAGS:
                 break
-            if event_id == _SLOT and payload == bytes(2):
-                if index + 1 < len(events) and events[index + 1][0] == _SLOT:
-                    return events[index + 1][1]
-                break
-        raise FlpError(f"mixer insert {insert_index} has no confirmed empty slot 0")
+            if event_id != _SLOT or payload != bytes(2):
+                continue
+            next_event = events[index + 1] if index + 1 < len(events) else None
+            if next_event is not None and next_event[0] == _SLOT:
+                return SpliceSite(next_event[1], next_event[1], None)
+            if next_event is not None and next_event[0] == _INTERNAL_NAME:
+                effect_head = next_event[1]
+                effect_end = _effect_end(events, index + 1)
+                if self._adding and bytes(stream[effect_head:effect_end]) != getattr(self, "_expected", None):
+                    raise FlpError("mixer insert 0 has no confirmed empty slot 0")
+                return SpliceSite(effect_head, effect_end, bytes(stream[effect_head:effect_end]))
+            break
+        raise FlpError("mixer insert 0 has no confirmed empty slot 0")
 
-    def encode(self, reference: PluginReference) -> bytes:
+    def encode(self, data: Sequence[PluginReference], ppq: int) -> bytes:
+        if len(data) != 1:
+            raise FlpError(f"an effect insertion needs exactly one captured reference, got {len(data)}")
+        (reference,) = data
+        try:
+            decoded = self.decode(reference.chunk, ppq)
+        except (TypeError, AttributeError) as error:
+            raise FlpError("effect reference has no valid captured chunk") from error
+        if len(decoded) != 1 or decoded[0].name != reference.name:
+            raise FlpError(f"captured chunk does not identify {reference.name!r}")
+        self._expected = reference.chunk
         return reference.chunk
 
-    def decode(self, stream: Stream, insert_index: int) -> list[Effect]:
-        events = _events(stream)
-        active = False
-        effects: list[Effect] = []
-        for index, (event_id, head, end, payload) in enumerate(events):
-            if event_id == EVENT_MIXER_FLAGS:
-                if active:
-                    break
-                active = len(payload) == 12 and int.from_bytes(payload[:4], "little") == insert_index
-                continue
-            if not active or event_id != _INTERNAL_NAME or index + 1 >= len(events):
-                continue
-            wrapper, _wrapper_head, _wrapper_end, _wrapper_payload = events[index + 1]
-            if wrapper != _WRAPPER:
-                continue
-            name = payload.decode("utf-16-le").rstrip("\0")
-            # A state event is optional in the general observed tuple.  The
-            # byte range through it is the only stable representation here.
-            state = next(
-                (
-                    candidate
-                    for candidate in events[index + 2 :]
-                    if candidate[0] in (_STATE, _INTERNAL_NAME, EVENT_MIXER_FLAGS)
-                ),
-                None,
-            )
-            end = state[2] if state is not None and state[0] == _STATE else events[index + 1][2]
-            effects.append(Effect(name, bytes(stream[head:end])))
-        return effects
+    def frame(self, payload: bytes) -> bytes:
+        """Plugin references are captured event tuples, not synthesized events."""
+        return payload
 
-    def verify(self, reference: PluginReference, effects: list[Effect]) -> None:
-        if any(effect.name == reference.name and effect.chunk == reference.chunk for effect in effects):
-            return
-        raise FlpError(f"readback has no byte-identical {reference.name!r} effect chunk")
+    def decode(self, blob: bytes, ppq: int) -> list[Effect]:
+        if not blob:
+            return []
+        try:
+            events = _events(Stream(blob))
+            if not events or events[0][0] != _INTERNAL_NAME:
+                raise FlpError("effect tuple does not start with PluginID.InternalName")
+            name = events[0][3].decode("utf-16-le").rstrip("\0")
+            end = _effect_end(events, 0)
+            return [Effect(name, blob[:end])]
+        except UnicodeDecodeError as error:
+            raise FlpError("effect name is not valid UTF-16-LE") from error
+
+    def verify(self, sent: Sequence[Effect], readback: Sequence[Effect]) -> None:
+        verify_identical(sent, readback, "the captured effect reference")
 
 
 def _events(stream: Stream) -> list[tuple[int, int, int, bytes]]:
-    """Fully decoded events with framing heads, from flpkit's canonical walker."""
+    """Fully decoded events with their framing bounds."""
     events = []
     head = 0
     for event_id, offset, size in stream:
@@ -161,16 +152,17 @@ def _events(stream: Stream) -> list[tuple[int, int, int, bytes]]:
     return events
 
 
-def apply_reference_save_mutations(raw: bytearray, header: bytes, stream: Stream) -> None:
-    """Apply the pair's separately-confirmed FL save mutations, if exact."""
-    if sha256(raw).hexdigest() != _REFERENCE_BASELINE_SHA256:
-        return
-    events = _events(stream)
-    base = 8 + len(header) + 8
-    for index, relative, before, after in _REFERENCE_MUTATIONS:
-        _event_id, head, end, payload = events[index]
-        payload_head = head + (end - head - len(payload))
-        at = base + payload_head + relative
-        if raw[at : at + len(before)] != before:
-            raise FlpError("reference-pair save mutation preimage drifted")
-        raw[at : at + len(after)] = after
+def _effect_end(events: Sequence[tuple[int, int, int, bytes]], name_index: int) -> int:
+    if name_index + 1 >= len(events) or events[name_index + 1][0] != _WRAPPER:
+        raise FlpError("effect tuple has no plugin wrapper event")
+    state = next(
+        (
+            event
+            for event in events[name_index + 2 :]
+            if event[0] in (_STATE, _INTERNAL_NAME, EVENT_MIXER_FLAGS)
+        ),
+        None,
+    )
+    if state is not None and state[0] == _STATE:
+        return state[2]
+    return events[name_index + 1][2]
