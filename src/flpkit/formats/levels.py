@@ -33,6 +33,7 @@ class Levels:
 class LevelsFormat:
     name = "levels"
     event_id = EVENT_CHANNEL_LEVELS
+    frame = None
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
         """The target channel's Levels event (first 24-byte 219 attributed to

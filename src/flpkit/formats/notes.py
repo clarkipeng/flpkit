@@ -97,6 +97,7 @@ class Note(NoteSpec):
 class NotesFormat:
     name = "notes"
     event_id = EVENT_PATTERN_NOTES
+    frame = None
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
         """The target pattern's notes blob (only a 224 event while that

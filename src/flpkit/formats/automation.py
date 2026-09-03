@@ -71,7 +71,8 @@ class AutomationPointSpec:
 class FlpAutomationPoint:
     """One decoded point, relative to the clip start. ``tail`` is FL's opaque
     4-byte per-point tail, carried raw so a decoded clip rewrites
-    byte-identically (verified across all 1,100 corpus blobs)."""
+    readback-identically; byte-identically for FL-authored blobs
+    (corpus-tested)."""
 
     position: float  # beats from clip start
     value: float  # normalized 0..1
@@ -82,6 +83,7 @@ class FlpAutomationPoint:
 class AutomationFormat:
     name = "automation"
     event_id = EVENT_CHANNEL_AUTOMATION
+    frame = None
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
         """The target channel's automation blob, refusing dishonest ground:

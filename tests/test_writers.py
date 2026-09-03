@@ -147,6 +147,13 @@ def test_add_effect_refuses_unproved_plugin_and_nonempty_slot(tmp_path):
         flp.add_effect(path, 0, "Fruity Parametric EQ 2")
 
 
+def test_effect_format_rejects_missing_insert_as_flp_error(tmp_path):
+    path = write_flp(tmp_path, VERSION_MODERN)
+
+    with pytest.raises(flp.FlpError, match="no mixer insert 0"):
+        flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+
+
 def test_effects_at_wraps_malformed_utf16_as_flp_error(tmp_path):
     reference = flp.DEFAULT_PLUGIN_DATABASE.reference("Fruity Parametric EQ 2")
     malformed = bytearray(reference.chunk)

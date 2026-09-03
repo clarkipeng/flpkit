@@ -19,6 +19,7 @@ EVENT_TEMPO_FINE = 93  # legacy u16 milli-BPM fraction added to coarse
 class TempoFormat:
     name = "tempo"
     event_id = EVENT_TEMPO
+    frame = None
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
         """The first tempo event, else the end-of-stream append point."""

@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from .detect import resolve_size_overrides
 
@@ -88,6 +88,7 @@ class Format(Protocol):
 
     name: str  # "notes", "playlist", "automation", "levels", "tempo", "effects"
     event_id: int  # the FLP event that carries it
+    frame: Callable[[bytes], bytes] | None  # custom event framing, if needed
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
         """WHERE this element lives (e.g. notes: the pattern's blob)."""
@@ -147,7 +148,7 @@ def patch(
     kept = fmt.decode(kept_blob, ppq) if kept_blob else []
     payload = fmt.encode([*kept, *data], ppq)
 
-    frame = getattr(fmt, "frame", None)
+    frame = fmt.frame
     event = site.prelude + (frame(payload) if frame is not None else frame_event(fmt.event_id, payload))
     raw[base + site.head : base + site.end] = event
     _bump_fldt_length(raw, len(event) - (site.end - site.head))

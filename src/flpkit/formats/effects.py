@@ -89,7 +89,7 @@ class EffectFormat:
             None,
         )
         if insert is None:
-            raise IndexError(f"no mixer insert {target.insert}")
+            raise FlpError(f"no mixer insert {target.insert}")
         for index, (event_id, _head, _end, payload) in enumerate(events[insert + 1 :], insert + 1):
             if event_id == EVENT_MIXER_FLAGS:
                 break
@@ -101,7 +101,7 @@ class EffectFormat:
             if next_event is not None and next_event[0] == _INTERNAL_NAME:
                 effect_head = next_event[1]
                 effect_end = _effect_end(events, index + 1)
-                if self._adding and bytes(stream[effect_head:effect_end]) != getattr(self, "_expected", None):
+                if self._adding:
                     raise FlpError("mixer insert 0 has no confirmed empty slot 0")
                 return SpliceSite(effect_head, effect_end, bytes(stream[effect_head:effect_end]))
             break
@@ -117,7 +117,9 @@ class EffectFormat:
             raise FlpError("effect reference has no valid captured chunk") from error
         if len(decoded) != 1 or decoded[0].name != reference.name:
             raise FlpError(f"captured chunk does not identify {reference.name!r}")
-        self._expected = reference.chunk
+        # ``patch`` locates once more to verify its saved readback.  Occupancy
+        # is only a pre-insertion requirement for this one-shot format.
+        self._adding = False
         return reference.chunk
 
     def frame(self, payload: bytes) -> bytes:
