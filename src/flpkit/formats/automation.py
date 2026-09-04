@@ -70,9 +70,8 @@ class AutomationPointSpec:
 @dataclass(frozen=True)
 class FlpAutomationPoint:
     """One decoded point, relative to the clip start. ``tail`` is FL's opaque
-    4-byte per-point tail, carried raw so a decoded clip rewrites
-    readback-identically; byte-identically for FL-authored blobs
-    (corpus-tested)."""
+    4-byte per-point tail, carried raw so a decoded clip is readback-identical;
+    it is byte-identical for FL-authored blobs (corpus-tested)."""
 
     position: float  # beats from clip start
     value: float  # normalized 0..1

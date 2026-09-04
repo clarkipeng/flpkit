@@ -465,8 +465,12 @@ def add_effect(
     if insert_index != 0:
         raise FlpError("effect add is only FL-authored for Master insert 0")
     reference = database.reference(plugin_name)
+    codec.read(
+        path, EffectFormat(adding=True), Target(insert=insert_index),
+        event_size_overrides=event_size_overrides,
+    )
     return codec.patch(
-        path, EffectFormat(adding=True), Target(insert=insert_index), [reference], "replace",
+        path, EffectFormat(), Target(insert=insert_index), [reference], "replace",
         event_size_overrides=event_size_overrides,
     )
 

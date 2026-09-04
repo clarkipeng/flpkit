@@ -11,10 +11,10 @@ write verifies itself by re-reading the saved file.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from .detect import resolve_size_overrides
 
@@ -88,7 +88,7 @@ class Format(Protocol):
 
     name: str  # "notes", "playlist", "automation", "levels", "tempo", "effects"
     event_id: int  # the FLP event that carries it
-    frame: Callable[[bytes], bytes] | None  # custom event framing, if needed
+    frame: Callable[[bytes], bytes] | None  # None = frame one event_id payload
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
         """WHERE this element lives (e.g. notes: the pattern's blob)."""

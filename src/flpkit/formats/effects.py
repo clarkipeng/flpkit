@@ -117,9 +117,6 @@ class EffectFormat:
             raise FlpError("effect reference has no valid captured chunk") from error
         if len(decoded) != 1 or decoded[0].name != reference.name:
             raise FlpError(f"captured chunk does not identify {reference.name!r}")
-        # ``patch`` locates once more to verify its saved readback.  Occupancy
-        # is only a pre-insertion requirement for this one-shot format.
-        self._adding = False
         return reference.chunk
 
     def frame(self, payload: bytes) -> bytes:
