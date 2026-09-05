@@ -11,13 +11,22 @@ keywords = ["fl-studio", "flp", "daw", "midi", "music"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Sound/Audio",
 ]
 
 [project.urls]
 Homepage = "https://github.com/clarkipeng/flpkit"
+Repository = "https://github.com/clarkipeng/flpkit"
 Issues = "https://github.com/clarkipeng/flpkit/issues"
+Changelog = "https://github.com/clarkipeng/flpkit/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
