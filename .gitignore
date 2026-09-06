@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 dist/
+
+# local secrets (PyPI token for uv publish)
+.env
+.env.*
