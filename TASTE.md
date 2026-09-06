@@ -2,7 +2,7 @@
 
 How we build. Every agent reads this before writing code.
 When a judgment call comes up, this doc decides it. Briefs add context, never new taste.
-Built from 12k of my own messages (June to September 2026); every rule traces to quotes in the local taste corpus.
+Built from my own messages (June to September 2026); supporting quotes are kept in the local taste corpus.
 
 ## How to work with me
 
@@ -42,8 +42,6 @@ Built from 12k of my own messages (June to September 2026); every rule traces to
 ## Process
 
 - Fix real problems before building features. Reproduce bugs end to end as a user first, and test the real user path before claiming a cause or a fix.
-- Small, specified fixes get done directly. A worker costs 30-45 minutes for any size change; dispatch only work that is genuinely long, heavy, or parallel.
-- Batch the work: read everything needed once, then write code, tests, and run the suite in one go. Fewer roundtrips, fewer tokens. Prove prerequisites cheaply before an expensive end-to-end run; a long series of dry runs is not discovery.
 - Reviews match blast radius. Kernel, schema, and seam changes get an independent adversarial review. Small fixes get one probe of the real risk plus one test that fails without the fix.
 - Every test says why it exists, especially regression guards. Test the invariant that prevented the incident, including timing and recovery boundaries. Never weaken or skip a test to look green; refactors ship with tests moved, never weakened.
 - Run the local checks the change's risk actually warrants before pushing. CI confirms; it never discovers. Measure before adding process.
@@ -69,7 +67,7 @@ Built from 12k of my own messages (June to September 2026); every rule traces to
 
 ## Orchestration
 
-- Multi-slice work runs through SightMesh: sol manages, terra/luna execute, one program prefix per worker, disjoint file ownership, durable handoffs, the manager reviews and merges. The coordinator writes briefs, gathers evidence, deliberates with me, oversees merges, and deploys dev.
+- Follow the repository's current execution and review workflow. Keep one owner per deliverable, disjoint file ownership for parallel work, and durable handoffs. Model names and tool choices belong in operating instructions.
 - Don't coordinate with finished workers or nest orchestration. Read the diff, continue from the checkpoint. Report inherited blockers with the exact evidence.
 - Never invent a release flow, CLI, endpoint, identity, or policy from a plausible name. Verify it in live code and state first.
 
@@ -79,7 +77,10 @@ Built from 12k of my own messages (June to September 2026); every rule traces to
 - Secrets never print, only their shape. Anything that appeared in a transcript is exposed; rotate it.
 - If you're testing on my machine, don't take over my screen. Headless only.
 
-## Models and cost
+## Efficiency
 
-- Route by cognitive risk: Fable plans and reviews kernel-class changes; sol orchestrates; terra implements and audits; luna does bounded mechanical work. GPT (codex) and Claude accounts both exist; fail over on quota or auth errors only, never on test failures.
-- Fewer roundtrips, fewer tokens. A 15-minute direct fix beats a 45-minute worker round trip.
+- Minimize total tokens and elapsed time across implementation, context/prefill, management, communication, wakeups, review, and correction. Choose models and delegation by the cost of a correct result, including rework.
+- Work from relevant changes and focused queries. Batch independent reads and reuse valid results. Keep stable instructions and context reusable for caching; hand off decisions, exact paths, evidence, and blockers instead of repeating history.
+- Give each worker an independent deliverable. Use a manager only when coordination needs one; direct bounded work stays with its owner.
+- Prefer completion signals to repeated polling. Wake when new information, a deadline, or a stuck task requires a decision.
+- Give expensive checks a purpose and expected result. Prove prerequisites cheaply and reuse passing evidence until changed code or assumptions invalidate it. Preserve required correctness, safety, and understandable explanations while reducing overhead.
