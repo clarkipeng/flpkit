@@ -32,6 +32,9 @@ Every writer then **verifies itself**: it re-reads the saved file and field-matc
 - UTF-16/Latin-1 text switching keyed off the file's `FLVersion`
 - Playlist items per arrangement (pattern/audio clips: position, length, track, group), with the record stride DETECTED per blob - FL grew the record from 32 to 60 to 80 to 88 bytes across eras, and the constant `pattern_base` signature identifies the true size instead of a hardcoded list
 - Automation clips: each type-5 channel's points (position in beats from clip start, value 0..1, tension), decoded from the delta-encoded f64 records and verified point-identical to pyflp across 1,100 real blobs
+- What a project needs to open: the FL version that saved it, its title, whether a registered FL saved it, and `trial_saved` (an unregistered FL's save, which a trial FL refuses to reopen)
+- Plugins: each channel's generator and every loaded mixer slot (`mixer`, `mixer_slots`, `empty_slots(insert)`) by FL's internal name; a hosted VST/VST3/AU (`Fruity Wrapper`) also names the plugin, vendor and file path it hosts
+- Each sampler or audio-clip channel's sample path as FL stored it (for example `%FLStudioFactoryData%\Data\Patches\...` for FL's own samples)
 
 ## What it writes
 
@@ -42,7 +45,10 @@ Every writer then **verifies itself**: it re-reads the saved file and field-matc
 - `write_automation` - replaces the points inside an EXISTING automation channel's blob; the 17-byte header and the opaque era trailer are carried verbatim, absolute positions convert back to FL's stored x-deltas, and each point's opaque 4-byte tail rides along.
   Feeding a channel's decoded points straight back is readback-identical; it is byte-identical for FL-authored blobs in corpus tests.
   Creating a NEW clip is out of scope until the link bytes are decoded - a non-automation channel or a missing blob is an error, not an invitation to fabricate
-- `add_effect` and `effects_at` - splice and read captured mixer-effect references while preserving plugin state as opaque data
+- `add_effect` and `effects_at` - splice a captured, FL-authored effect reference into an empty Master slot (the wrapper's insert/slot rewritten the way FL writes them) and read one slot back; plugin state stays opaque.
+  The shipped references are Fruity Parametric EQ 2 and the FL MCP Bridge.
+  A slot is closed by its slot-index event and its plugin comes before it; FL's own wrappers agree on 3,544 of the 3,545 slot plugins in FL 2026's bundled projects
+- `hide_info_on_open` - turns off the project's info panel, which otherwise opens over FL and holds the foreground until clicked
 
 ## One engine, formats as data (0.6.0)
 

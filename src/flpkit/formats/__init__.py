@@ -7,11 +7,12 @@ from .effects import EffectFormat
 from .levels import LevelsFormat
 from .notes import NotesFormat
 from .playlist import PlaylistFormat
+from .show_info import ShowInfoFormat
 from .tempo import TempoFormat
 
 # Every Format this library ships, for generic iteration (e.g. round-trip
 # suites). Classes, not instances: a Format instance is call-scoped (its
 # locate captures in-file templates), so construct one per use.
-ALL = (NotesFormat, PlaylistFormat, AutomationFormat, LevelsFormat, TempoFormat, EffectFormat)
+ALL = (NotesFormat, PlaylistFormat, AutomationFormat, LevelsFormat, TempoFormat, EffectFormat, ShowInfoFormat)
 
-__all__ = ["ALL", "AutomationFormat", "EffectFormat", "LevelsFormat", "NotesFormat", "PlaylistFormat", "TempoFormat"]
+__all__ = ["ALL", "AutomationFormat", "EffectFormat", "LevelsFormat", "NotesFormat", "PlaylistFormat", "ShowInfoFormat", "TempoFormat"]

@@ -12,7 +12,6 @@ from flpkit.codec import EVENT_MIXER_FLAGS, FlpError, SpliceSite, Stream, Target
 
 _INTERNAL_NAME = 201
 _WRAPPER = 212
-_STATE = 213
 _SLOT = 98
 _RESOURCE_DIR = ("data", "plugins")
 
@@ -67,45 +66,61 @@ DEFAULT_PLUGIN_DATABASE = PluginDatabase()
 
 
 class EffectFormat:
-    """The proven empty Master slot 0 insertion, expressed as a Format."""
+    """One mixer slot's plugin tuple: read it, or splice a captured reference
+    into an empty slot.
+
+    Facts, corpus-checked on FL Studio 2026's 164 bundled projects (FL's own
+    wrappers agree on 3,544 of 3,545 slot plugins; the one left names insert 501):
+
+    - Insert ``n`` of the mixer opens at the ``n``-th InsertID.Flags event
+      (236, counting from 0 = Master). Its first u32 is flags, not the index.
+    - Each slot is closed by a SlotID.Index event (98) whose low byte is the
+      slot number; the slot's plugin tuple (201 internal name, 212 wrapper,
+      optional 203 rename, 155/128/41, optional 213 state) comes BEFORE it.
+      An empty slot is a 98 with no 201 since the previous slot or the insert's
+      236. (FL's own save of "Parametric EQ 2 added to Master" put the tuple
+      between ``98=0`` and ``98=1``: Master slot 1, its wrapper says ``0, 1``.)
+    - The wrapper event's first two u32s are the insert and slot indices; a
+      spliced reference gets them rewritten to its new place.
+    """
 
     name = "effects"
     event_id = _INTERNAL_NAME
 
     def __init__(self, *, adding: bool = False):
         self._adding = adding
+        self._target: Target | None = None
 
     def locate(self, stream: Stream, target: Target) -> SpliceSite:
-        if target.insert != 0:
-            raise FlpError("effect add is only FL-authored for Master insert 0")
+        if target.insert is None or target.slot is None:
+            raise FlpError("an effect is addressed by insert and slot")
+        if self._adding and target.insert != 0:
+            raise FlpError("effect add is only FL-authored for the Master insert (0)")
+        self._target = target
         events = _events(stream)
-        insert = next(
-            (
-                index
-                for index, (event_id, _head, _end, payload) in enumerate(events)
-                if event_id == EVENT_MIXER_FLAGS and len(payload) == 12
-                and int.from_bytes(payload[:4], "little") == target.insert
-            ),
-            None,
-        )
-        if insert is None:
+        opens = [i for i, event in enumerate(events) if event[0] == EVENT_MIXER_FLAGS]
+        if target.insert >= len(opens):
             raise FlpError(f"no mixer insert {target.insert}")
-        for index, (event_id, _head, _end, payload) in enumerate(events[insert + 1 :], insert + 1):
-            if event_id == EVENT_MIXER_FLAGS:
-                break
-            if event_id != _SLOT or payload != bytes(2):
+        first = opens[target.insert] + 1
+        last = opens[target.insert + 1] if target.insert + 1 < len(opens) else len(events)
+        slot_open = first
+        for index in range(first, last):
+            event_id, head, _end, payload = events[index]
+            if event_id != _SLOT or len(payload) != 2:
                 continue
-            next_event = events[index + 1] if index + 1 < len(events) else None
-            if next_event is not None and next_event[0] == _SLOT:
-                return SpliceSite(next_event[1], next_event[1], None)
-            if next_event is not None and next_event[0] == _INTERNAL_NAME:
-                effect_head = next_event[1]
-                effect_end = _effect_end(events, index + 1)
-                if self._adding:
-                    raise FlpError("mixer insert 0 has no confirmed empty slot 0")
-                return SpliceSite(effect_head, effect_end, bytes(stream[effect_head:effect_end]))
-            break
-        raise FlpError("mixer insert 0 has no confirmed empty slot 0")
+            if payload[0] != target.slot:
+                slot_open = index + 1
+                continue
+            plugin = next(
+                (i for i in range(slot_open, index) if events[i][0] == _INTERNAL_NAME), None
+            )
+            if plugin is None:
+                return SpliceSite(head, head, None)
+            if self._adding:
+                raise FlpError(f"mixer insert {target.insert} slot {target.slot} is not empty")
+            effect_head = events[plugin][1]
+            return SpliceSite(effect_head, head, bytes(stream[effect_head:head]))
+        raise FlpError(f"mixer insert {target.insert} has no slot {target.slot}")
 
     def encode(self, data: Sequence[PluginReference], ppq: int) -> bytes:
         if len(data) != 1:
@@ -120,7 +135,8 @@ class EffectFormat:
         # ``patch`` locates once more to verify its saved readback.  Occupancy
         # is only a pre-insertion requirement for this one-shot format.
         self._adding = False
-        return reference.chunk
+        assert self._target is not None and self._target.insert is not None and self._target.slot is not None
+        return _placed(reference.chunk, self._target.insert, self._target.slot)
 
     def frame(self, payload: bytes) -> bytes:
         """Plugin references are captured event tuples, not synthesized events."""
@@ -133,14 +149,27 @@ class EffectFormat:
             events = _events(Stream(blob))
             if not events or events[0][0] != _INTERNAL_NAME:
                 raise FlpError("effect tuple does not start with PluginID.InternalName")
+            if len(events) < 2 or events[1][0] != _WRAPPER:
+                raise FlpError("effect tuple has no plugin wrapper event")
             name = events[0][3].decode("utf-16-le").rstrip("\0")
-            end = _effect_end(events, 0)
-            return [Effect(name, blob[:end])]
+            return [Effect(name, blob)]
         except UnicodeDecodeError as error:
             raise FlpError("effect name is not valid UTF-16-LE") from error
 
     def verify(self, sent: Sequence[Effect], readback: Sequence[Effect]) -> None:
         verify_identical(sent, readback, "the captured effect reference")
+
+
+def _placed(chunk: bytes, insert: int, slot: int) -> bytes:
+    """The captured tuple with its wrapper's insert and slot rewritten."""
+    events = _events(Stream(chunk))
+    _id, _head, end, payload = events[1]
+    if len(payload) < 8:
+        raise FlpError("effect wrapper event is too short to carry its insert and slot")
+    at = end - len(payload)
+    placed = bytearray(chunk)
+    placed[at : at + 8] = insert.to_bytes(4, "little") + slot.to_bytes(4, "little")
+    return bytes(placed)
 
 
 def _events(stream: Stream) -> list[tuple[int, int, int, bytes]]:
@@ -152,19 +181,3 @@ def _events(stream: Stream) -> list[tuple[int, int, int, bytes]]:
         events.append((event_id, head, end, bytes(stream[offset:end])))
         head = end
     return events
-
-
-def _effect_end(events: Sequence[tuple[int, int, int, bytes]], name_index: int) -> int:
-    if name_index + 1 >= len(events) or events[name_index + 1][0] != _WRAPPER:
-        raise FlpError("effect tuple has no plugin wrapper event")
-    state = next(
-        (
-            event
-            for event in events[name_index + 2 :]
-            if event[0] in (_STATE, _INTERNAL_NAME, EVENT_MIXER_FLAGS)
-        ),
-        None,
-    )
-    if state is not None and state[0] == _STATE:
-        return state[2]
-    return events[name_index + 1][2]

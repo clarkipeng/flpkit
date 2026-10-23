@@ -87,20 +87,53 @@ def mixer_insert(index: int, *events: bytes) -> bytes:
 
 
 def test_add_effect_splices_the_confirmed_eq2_chunk_and_reparses(tmp_path):
+    # FL's own save of "EQ 2 added to Master" put the tuple between 98=0 and 98=1:
+    # the 98 CLOSES its slot, so that is slot 1, and the splice lands before 98=1.
     empty_slot_zero = event(98, b"\0\0")
     slot_one = event(98, b"\1\0")
     path = write_flp(tmp_path, VERSION_MODERN + mixer_insert(0, empty_slot_zero, slot_one))
     before = path.read_bytes()
     _header, before_stream = flp._chunks(before)
 
-    saved = flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+    saved = flp.add_effect(path, 0, "Fruity Parametric EQ 2", slot=1)
 
     assert [effect.name for effect in saved] == ["Fruity Parametric EQ 2"]
-    assert flp.effects_at(path, 0) == saved
+    assert flp.effects_at(path, 0, slot=1) == saved
+    assert flp.effects_at(path, 0, slot=0) == []
+    # The captured chunk was itself saved at Master slot 1, so it splices verbatim.
+    assert saved[0].chunk == flp.DEFAULT_PLUGIN_DATABASE.reference("Fruity Parametric EQ 2").chunk
     _header, after_stream = flp._chunks(path.read_bytes())
     splice_at = len(before_stream) - len(slot_one)
     assert after_stream[:splice_at] == before_stream[:splice_at]
     assert after_stream[splice_at + len(saved[0].chunk) :] == before_stream[splice_at:]
+
+
+def test_add_effect_rewrites_the_wrapper_to_its_new_slot(tmp_path):
+    # Why: FL writes each tuple's wrapper as (insert, slot); a reference captured in
+    # slot 0 must say slot 9 once it sits there, or the file disagrees with itself.
+    slots = [event(98, bytes([n, 0])) for n in range(10)]
+    path = write_flp(tmp_path, VERSION_MODERN + mixer_insert(0, *slots))
+
+    (bridge,) = flp.add_effect(path, 0, "FL MCP Bridge", slot=9)
+
+    wrapper = list(flp.codec.Stream(bridge.chunk))[1]
+    _id, offset, _size = wrapper
+    assert struct.unpack_from("<II", bridge.chunk, offset) == (0, 9)
+    (effect,) = flp.read(path).mixer
+    assert (effect.insert, effect.slot, effect.plugin.internal_name) == (0, 9, "FL MCP Bridge")
+
+
+def test_effects_follow_the_insert_ordinal_not_the_flags_word(tmp_path):
+    # The n-th 236 opens insert n; its first u32 is flags (nonzero in real files).
+    master = event(236, struct.pack("<III", 7, 12, 0)) + event(98, b"\0\0")
+    insert_one = event(236, struct.pack("<III", 7, 12, 0)) + event(98, b"\0\0") + event(98, b"\1\0")
+    path = write_flp(tmp_path, VERSION_MODERN + master + insert_one)
+
+    with pytest.raises(flp.FlpError, match="only FL-authored for the Master insert"):
+        flp.add_effect(path, 1, "Fruity Parametric EQ 2", slot=1)
+    flp.add_effect(path, 0, "Fruity Parametric EQ 2", slot=0)
+    assert [(e.insert, e.slot) for e in flp.read(path).mixer] == [(0, 0)]
+    assert flp.effects_at(path, 1, slot=1) == []
 
 
 def test_codec_patch_validates_mode_and_format_inputs(tmp_path):
@@ -139,19 +172,23 @@ def test_add_effect_refuses_unproved_plugin_and_nonempty_slot(tmp_path):
     )
 
     with pytest.raises(flp.FlpError, match="no FL-authored default-state reference"):
-        flp.add_effect(path, 0, "Fruity Reeverb 2")
-    with pytest.raises(flp.FlpError, match="Master insert 0"):
-        flp.add_effect(path, 1, "Fruity Parametric EQ 2")
-    flp.add_effect(path, 0, "Fruity Parametric EQ 2")
-    with pytest.raises(flp.FlpError, match="empty slot 0"):
-        flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+        flp.add_effect(path, 0, "Fruity Reeverb 2", slot=1)
+    with pytest.raises(flp.FlpError, match="Master insert"):
+        flp.add_effect(path, 1, "Fruity Parametric EQ 2", slot=1)
+    with pytest.raises(flp.FlpError, match="has no slot 5"):
+        flp.add_effect(path, 0, "Fruity Parametric EQ 2", slot=5)
+    flp.add_effect(path, 0, "Fruity Parametric EQ 2", slot=1)
+    before = path.read_bytes()
+    with pytest.raises(flp.FlpError, match="slot 1 is not empty"):
+        flp.add_effect(path, 0, "Fruity Parametric EQ 2", slot=1)
+    assert path.read_bytes() == before
 
 
 def test_effect_format_rejects_missing_insert_as_flp_error(tmp_path):
     path = write_flp(tmp_path, VERSION_MODERN)
 
     with pytest.raises(flp.FlpError, match="no mixer insert 0"):
-        flp.add_effect(path, 0, "Fruity Parametric EQ 2")
+        flp.add_effect(path, 0, "Fruity Parametric EQ 2", slot=1)
 
 
 def test_effects_at_wraps_malformed_utf16_as_flp_error(tmp_path):
@@ -165,7 +202,32 @@ def test_effects_at_wraps_malformed_utf16_as_flp_error(tmp_path):
     )
 
     with pytest.raises(flp.FlpError, match="UTF-16"):
-        flp.effects_at(path, 0)
+        flp.effects_at(path, 0, slot=1)
+
+
+@requires_fl
+def test_bridge_splices_into_every_bundled_projects_last_free_master_slot(tmp_path):
+    # Why: the arena prepares a user's own project by adding the FL MCP Bridge to the
+    # Master's last free slot. On every FL-authored project that has one, the splice
+    # must add exactly the tuple, change no other byte, and read back where it went.
+    spliced = 0
+    for source in sorted(_FL_DATA.rglob("*.flp")):
+        project = flp.read(source)
+        free = project.empty_slots(0)
+        if not free:
+            continue
+        path = tmp_path / "p.flp"
+        shutil.copy(source, path)
+        (bridge,) = flp.add_effect(path, 0, "FL MCP Bridge", slot=free[-1])
+        after = flp.read(path)
+        assert after.mixer == tuple(sorted(
+            (*project.mixer, flp.FlpMixerEffect(0, free[-1], flp.FlpPlugin("FL MCP Bridge"))),
+            key=lambda e: (e.insert, e.slot),
+        )), source.name
+        assert (after.channels, after.notes, after.playlist) == (project.channels, project.notes, project.playlist)
+        assert len(path.read_bytes()) == len(source.read_bytes()) + len(bridge.chunk)
+        spliced += 1
+    assert spliced > 100
 
 
 def test_codec_read_absent_tempo_is_empty(tmp_path):

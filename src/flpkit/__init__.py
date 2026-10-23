@@ -58,7 +58,15 @@ from .detect import (
     PLAYLIST_TRACK_SPACE,
     _log_size_override_fallback,
 )
-from .formats import AutomationFormat, EffectFormat, LevelsFormat, NotesFormat, PlaylistFormat, TempoFormat
+from .formats import (
+    AutomationFormat,
+    EffectFormat,
+    LevelsFormat,
+    NotesFormat,
+    PlaylistFormat,
+    ShowInfoFormat,
+    TempoFormat,
+)
 from .formats.automation import (
     AUTOMATION_TAIL_DEFAULT,
     CHANNEL_TYPE_AUTOMATION,
@@ -88,12 +96,25 @@ from .formats.notes import (
     NoteSpec,
 )
 from .formats.playlist import EVENT_ARRANGEMENT_NEW, EVENT_PLAYLIST, ClipLike, ClipSpec
+from .formats.show_info import EVENT_SHOW_INFO
 from .formats.tempo import EVENT_TEMPO, EVENT_TEMPO_COARSE, EVENT_TEMPO_FINE
+from .plugins import (
+    EVENT_PLUGIN_DATA,
+    EVENT_PLUGIN_WRAPPER,
+    WRAPPER_INTERNAL_NAME,
+    FlpPlugin,
+    FlpVst,
+    vst_identity,
+)
 
 log = logging.getLogger("flpkit")
 
 NoteWriteMode = Mode
 EVENT_VERSION = 199  # ascii "major.minor..."; >= 11.5 -> text events are UTF-16-LE
+EVENT_LICENSED = 28  # 1 byte: 1 when the project was last saved by a registered FL (pyflp ProjectID.Licensed)
+EVENT_TITLE = 194  # project title text (pyflp ProjectID.Title)
+EVENT_SAMPLE_PATH = 196  # a sampler/audio-clip channel's sample path (pyflp ChannelID.SamplePath)
+EVENT_SLOT_INDEX = 98  # closes a mixer slot; low byte = slot number (see formats/effects.py)
 PPQ_DEFAULT = 96
 __version__ = version("flpkit")
 
@@ -143,10 +164,21 @@ class FlpChannel:
     pitch_semitones: int
     kind: int | None = None  # EVENT_CHANNEL_TYPE byte; None when the file omits it
     automation: tuple[FlpAutomationPoint, ...] = ()
+    plugin: FlpPlugin | None = None  # the generator plugin; None for samplers and audio clips
+    sample_path: str = ""  # the sample a sampler/audio-clip channel plays, as FL stored it; "" when none
 
     @property
     def is_automation(self) -> bool:
         return self.kind == CHANNEL_TYPE_AUTOMATION
+
+
+@dataclass(frozen=True)
+class FlpMixerEffect:
+    """One plugin loaded in a mixer insert's effect slot."""
+
+    insert: int  # 0 = Master
+    slot: int  # 0-based slot index within the insert
+    plugin: FlpPlugin
 
 
 @dataclass(frozen=True)
@@ -181,6 +213,22 @@ class FlpProject:
     channels: tuple[FlpChannel, ...]
     notes: tuple[FlpNote, ...]  # all patterns; filter by pattern via notes_at
     playlist: tuple[FlpPlaylistItem, ...] = ()  # all arrangements' clips
+    fl_version: str = ""  # the FL Studio version that last saved the file, e.g. "26.1.6.5639"; "" when absent
+    licensed: bool | None = None  # saved by a registered FL; None when the file omits the flag
+    title: str = ""
+    mixer: tuple[FlpMixerEffect, ...] = ()  # every loaded effect slot, by insert then slot
+    mixer_slots: tuple[tuple[int, int], ...] = ()  # every (insert, slot) the file has, loaded or empty
+    # Saved by an unregistered (trial) FL: it scrambles the saved values, and a trial
+    # FL then refuses to reopen the file (it opens an empty project behind a Buy
+    # dialog). Detected as: not licensed, and most slot-index events (98) out of
+    # range. Evidence: all 40 FL 26.1.6 trial saves checked have every slot index
+    # scrambled; none of the 86 unlicensed projects FL 2026 bundles has one.
+    trial_saved: bool = False
+
+    def empty_slots(self, insert: int) -> list[int]:
+        """The insert's slots with no plugin loaded, in order."""
+        loaded = {e.slot for e in self.mixer if e.insert == insert}
+        return [slot for i, slot in self.mixer_slots if i == insert and slot not in loaded]
 
     def notes_in(self, pattern: int, channel: int | None = None) -> list[FlpNote]:
         """Notes in one pattern, optionally one channel."""
@@ -220,6 +268,8 @@ def read(path: Path, *, event_size_overrides: Mapping[int, int] | None = None) -
     header, raw = _chunks(path.read_bytes())
     stream = codec.Stream(raw, event_size_overrides)
     ppq = int.from_bytes(header[4:6], "little")
+    if ppq == 0:
+        raise FlpError("FLhd header declares PPQ 0 at offset 12")
     # CHANNEL 0 IS IMPLICIT (see Stream.channel_events). Verified corpus-wide:
     # FLhd nChannels == |{0} union {New payloads}| on all 164 bundled projects.
     n_channels = int.from_bytes(header[2:4], "little")
@@ -233,15 +283,34 @@ def read(path: Path, *, event_size_overrides: Mapping[int, int] | None = None) -
     notes: list[FlpNote] = []
     arrangement = 0
     playlist: list[FlpPlaylistItem] = []
+    fl_version = ""
+    licensed: bool | None = None
+    title = ""
+    open_channel: int | None = None  # the rack channel later unscoped plugin/sample events belong to
+    mixer = _MixerWalk()
 
     for channel, event_id, _head, off, size in stream.channel_events():
         payload = bytes(stream[off : off + size])
+        if event_id == EVENT_MIXER_FLAGS:
+            open_channel = None
         if channel is not None:
+            open_channel = channel
             fields = channel_map.setdefault(channel, {"index": channel})
             if event_id != EVENT_CHANNEL_NEW:
                 _apply_channel_event(fields, event_id, payload, unicode_text, off, ppq)
+        elif open_channel is not None and event_id in _CHANNEL_PLUGIN_EVENTS:
+            # Sample paths and plugin state are not channel-SCOPED (they never open
+            # channel 0 on their own), but inside an open channel block they are its.
+            _apply_channel_event(channel_map[open_channel], event_id, payload, unicode_text, off, ppq)
+        elif mixer.started or event_id == EVENT_MIXER_FLAGS:
+            mixer.event(event_id, payload, unicode_text, off)
         elif event_id == EVENT_VERSION:
             unicode_text = _version_is_unicode(payload, off)
+            fl_version = payload.decode("ascii").rstrip("\0")
+        elif event_id == EVENT_LICENSED and size == 1:
+            licensed = payload[0] == 1
+        elif event_id == EVENT_TITLE:
+            title = _text(payload, unicode_text, off)
         elif event_id == EVENT_TEMPO and size == 4:
             tempo = int.from_bytes(payload, "little") / 1000
         elif event_id == EVENT_TEMPO_COARSE and size == 2 and coarse is None:
@@ -274,6 +343,7 @@ def read(path: Path, *, event_size_overrides: Mapping[int, int] | None = None) -
                 continue
             notes.extend(_flp_note(n, ppq, pattern) for n in NotesFormat().decode(payload, ppq))
 
+    mixer.flush()
     if tempo is None and coarse is not None:
         tempo = coarse + fine / 1000  # pre-156 files store tempo as a word pair
     if channel_map and len(channel_map) != n_channels:
@@ -287,7 +357,79 @@ def read(path: Path, *, event_size_overrides: Mapping[int, int] | None = None) -
         channels=tuple(_build_channel(channel_map[iid]) for iid in sorted(channel_map)),
         notes=tuple(notes),
         playlist=tuple(playlist),
+        fl_version=fl_version,
+        licensed=licensed,
+        title=title,
+        mixer=tuple(mixer.effects),
+        mixer_slots=tuple(mixer.slots),
+        trial_saved=licensed is False and mixer.scrambled * 2 > mixer.slot_events > 0,
     )
+
+
+class _MixerWalk:
+    """Attribute mixer-section plugin tuples to (insert, slot).
+
+    The layout facts and their evidence are formats/effects.py's EffectFormat:
+    the n-th InsertID.Flags (236) opens insert n (0 = Master), and a slot's
+    plugin tuple comes BEFORE the SlotID.Index (98) that closes it, whose low
+    byte is the slot number. Files from before slot events (FL 10 era) carry no
+    98s; there a tuple's slot is the one its wrapper event (212) names.
+    """
+
+    def __init__(self) -> None:
+        self.started = False
+        self.effects: list[FlpMixerEffect] = []
+        self.slots: list[tuple[int, int]] = []
+        self.slot_events = 0
+        self.scrambled = 0  # slot-index values no FL slot layout uses (see FlpProject.trial_saved)
+        self._insert = -1
+        self._pending: dict | None = None
+
+    def event(self, event_id: int, payload: bytes, unicode_text: bool, offset: int) -> None:
+        if event_id == EVENT_MIXER_FLAGS:
+            self.flush()
+            self.started = True
+            self._insert += 1  # the n-th InsertID.Flags opens insert n (its u32 is flags)
+        elif event_id == EVENT_SLOT_INDEX and len(payload) == 2 and self._insert >= 0:
+            self.slot_events += 1
+            self.scrambled += int.from_bytes(payload, "little") > 0x3F
+            self.slots.append((self._insert, payload[0]))
+            self._close(payload[0])
+        elif event_id == EVENT_NAME_INTERNAL:
+            self.flush()
+            self._pending = {"name_internal": _text(payload, unicode_text, offset)}
+        elif self._pending is None:
+            return
+        elif event_id == EVENT_NAME_USER:
+            self._pending["name_user"] = _text(payload, unicode_text, offset)
+        elif event_id == EVENT_PLUGIN_WRAPPER and len(payload) >= 8:
+            self._pending["wrapper_slot"] = payload[4]
+        elif event_id == EVENT_PLUGIN_DATA:
+            self._pending["vst"] = vst_identity(payload)
+
+    def flush(self) -> None:
+        """A tuple no slot event closed (pre-slot-event files): its wrapper names the slot."""
+        if self._pending is not None and "wrapper_slot" in self._pending:
+            self._close(self._pending["wrapper_slot"])
+        self._pending = None
+
+    def _close(self, slot: int) -> None:
+        plugin = _plugin(self._pending) if self._pending is not None else None
+        if plugin is not None:
+            self.effects.append(FlpMixerEffect(self._insert, slot, plugin))
+        self._pending = None
+
+
+def _plugin(fields: dict) -> FlpPlugin | None:
+    internal = fields.get("name_internal", "")
+    if not internal:
+        return None
+    vst = fields.get("vst") if internal == WRAPPER_INTERNAL_NAME else None
+    return FlpPlugin(internal_name=internal, name=fields.get("name_user", ""), vst=vst)
+
+
+# Events that belong to the open rack channel without being channel-scoped.
+_CHANNEL_PLUGIN_EVENTS = frozenset((EVENT_SAMPLE_PATH, EVENT_PLUGIN_DATA))
 
 
 # Raw-field keys a channel block accumulates before _build_channel resolves them.
@@ -323,6 +465,10 @@ def _apply_channel_event(
         fields["kind"] = payload[0]
     elif event_id == EVENT_CHANNEL_AUTOMATION:
         fields["automation"] = tuple(AutomationFormat().decode(payload, ppq))
+    elif event_id == EVENT_SAMPLE_PATH:
+        fields["sample_path"] = _text(payload, unicode_text, offset)
+    elif event_id == EVENT_PLUGIN_DATA:
+        fields["vst"] = vst_identity(payload)
 
 
 def _build_channel(fields: dict) -> FlpChannel:
@@ -343,6 +489,8 @@ def _build_channel(fields: dict) -> FlpChannel:
         pitch_semitones=int(fields.get("levels_pitch", 0)),
         kind=int(kind) if kind is not None else None,
         automation=fields.get("automation", ()),
+        plugin=_plugin(fields),
+        sample_path=str(fields.get("sample_path", "")),
     )
 
 
@@ -440,11 +588,17 @@ def write_automation(
 
 
 def effects_at(
-    path: Path, insert_index: int, *, event_size_overrides: Mapping[int, int] | None = None
+    path: Path,
+    insert_index: int,
+    *,
+    slot: int,
+    event_size_overrides: Mapping[int, int] | None = None,
 ) -> list[Effect]:
-    """The decoded effect instances in one mixer insert of the saved file."""
+    """The effect in one mixer slot of the saved file: ``[effect]``, or ``[]``
+    when the slot is empty. ``read(path).mixer`` lists every loaded slot."""
     return codec.read(
-        path, EffectFormat(), Target(insert=insert_index), event_size_overrides=event_size_overrides
+        path, EffectFormat(), Target(insert=insert_index, slot=slot),
+        event_size_overrides=event_size_overrides,
     )
 
 
@@ -453,21 +607,22 @@ def add_effect(
     insert_index: int,
     plugin_name: str,
     *,
+    slot: int,
     database: PluginDatabase = DEFAULT_PLUGIN_DATABASE,
     event_size_overrides: Mapping[int, int] | None = None,
 ) -> list[Effect]:
-    """Add an FL-authored effect reference, then reparse and verify it.
+    """Splice an FL-authored effect reference into an EMPTY slot of the Master
+    insert, then reparse and verify it. Returns the slot's readback.
 
-    Only the registry's Fruity Parametric EQ 2 reference on Master insert 0,
-    empty slot 0 is proven.  Unknown names and every other placement refuse
-    before the file changes.
+    The reference is captured FL output (``data/plugins``), placed with its
+    wrapper's insert/slot rewritten to the target, the way FL writes them.
+    Unknown names, other inserts and occupied slots refuse before the file
+    changes.
     """
-    if insert_index != 0:
-        raise FlpError("effect add is only FL-authored for Master insert 0")
     reference = database.reference(plugin_name)
     return codec.patch(
-        path, EffectFormat(adding=True), Target(insert=insert_index), [reference], "replace",
-        event_size_overrides=event_size_overrides,
+        path, EffectFormat(adding=True), Target(insert=insert_index, slot=slot), [reference],
+        "replace", event_size_overrides=event_size_overrides,
     )
 
 
@@ -510,3 +665,17 @@ def set_tempo(
         event_size_overrides=event_size_overrides,
     )
     return stored
+
+
+def hide_info_on_open(path: Path, *, event_size_overrides: Mapping[int, int] | None = None) -> bool:
+    """Turn off the project's "show info on open" panel (see formats/show_info.py),
+    which otherwise takes FL's foreground when the project loads. Returns True
+    when the file changed; a file without the flag (FL's off) is left untouched."""
+    try:
+        (shown,) = codec.read(path, ShowInfoFormat(), Target(), event_size_overrides=event_size_overrides)
+    except FlpError:
+        return False
+    if not shown:
+        return False
+    codec.patch(path, ShowInfoFormat(), Target(), [False], "replace", event_size_overrides=event_size_overrides)
+    return True
