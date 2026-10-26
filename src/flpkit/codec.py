@@ -59,6 +59,7 @@ class Target:
     channel: int | None = None
     arrangement: int | None = None
     insert: int | None = None
+    slot: int | None = None
 
 
 @dataclass(frozen=True)

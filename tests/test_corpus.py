@@ -98,3 +98,36 @@ def test_corpus_files_all_read(tmp_path):
     for source in files:
         project = flp.read(source)
         assert project.ppq > 0
+
+
+@requires_fl
+def test_corpus_mixer_slots_agree_with_fl_wrappers():
+    # Why: the insert/slot rule (n-th 236 opens insert n; a tuple precedes the 98 that
+    # closes its slot) is inferred. FL writes each tuple's own (insert, slot) into its
+    # wrapper event, so the reader's attribution must agree with FL's on real files.
+    agree = disagree = 0
+    for source in corpus_files():
+        stream = flp.codec.Stream(flp.codec.chunks(source.read_bytes())[1])
+        wrappers = []
+        mixer_seen = False
+        name = None
+        for event_id, off, size in stream:
+            payload = bytes(stream[off : off + size])
+            mixer_seen = mixer_seen or event_id == flp.EVENT_MIXER_FLAGS
+            if mixer_seen and event_id == flp.EVENT_NAME_INTERNAL:
+                name = payload
+            elif mixer_seen and event_id == 212 and name is not None and size >= 8:
+                wrappers.append((int.from_bytes(payload[:4], "little"), payload[4]))
+                name = None
+        placed = [(e.insert, e.slot) for e in flp.read(source).mixer]
+        assert len(placed) == len(wrappers), source.name
+        agree += sum(p == w for p, w in zip(placed, wrappers))
+        disagree += sum(p != w for p, w in zip(placed, wrappers))
+    # 3,544 of 3,545 slot plugins; FL's own odd one is a wrapper naming insert 501.
+    assert agree >= 3500 and disagree <= 3
+
+
+@requires_fl
+def test_no_bundled_project_reads_as_trial_saved():
+    # 86 bundled projects are unlicensed (old Image-Line saves) and FL's trial opens them.
+    assert not [source.name for source in corpus_files() if flp.read(source).trial_saved]

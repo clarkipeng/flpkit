@@ -519,3 +519,101 @@ def test_automation_blob_with_lying_count_decodes_to_nothing(tmp_path, caplog):
     assert project.channels[0].automation == ()
     assert project.tempo == 125.0
     assert any("automation" in r.message for r in caplog.records)
+
+
+# -- what a project needs to open: version, licence flag, plugins, samples, mixer --
+
+
+def plugin_tuple(name: str, *, rename: str = "", state: bytes | None = None, insert: int = 0, slot: int = 0) -> bytes:
+    events = event(flp.EVENT_NAME_INTERNAL, f"{name}\0".encode("utf-16-le"))
+    events += event(212, struct.pack("<III", insert, slot, 2) + b"\0" * 40)
+    if rename:
+        events += event(flp.EVENT_NAME_USER, f"{rename}\0".encode("utf-16-le"))
+    if state is not None:
+        events += event(213, state)
+    return events
+
+
+def vst_state(name: str, vendor: str = "", path: str = "") -> bytes:
+    records = b""
+    for record, text in ((54, name), (56, vendor), (55, path)):
+        data = text.encode("utf-8")
+        records += struct.pack("<IQ", record, len(data)) + data
+    return struct.pack("<I", 8) + records
+
+
+def test_project_identity_fields(tmp_path):
+    # Why: a project saved by an unregistered FL cannot be opened by a trial FL,
+    # and a newer FL version may not open in an older one; callers must see both.
+    events = event(flp.EVENT_VERSION, b"26.1.6.5639\0") + event(flp.EVENT_LICENSED, b"\0")
+    events += event(flp.EVENT_TITLE, "My song\0".encode("utf-16-le"))
+    project = flp.read(write_flp(tmp_path, events))
+    assert (project.fl_version, project.licensed, project.title) == ("26.1.6.5639", False, "My song")
+    bare = flp.read(write_flp(tmp_path, VERSION_MODERN))
+    assert (bare.licensed, bare.title) == (None, "")
+
+
+def test_channel_plugin_vst_and_sample_path(tmp_path):
+    # A sampler names its sample (196 is not channel-scoped, but belongs to the open
+    # channel); a generator names its plugin; a Fruity Wrapper names the hosted VST.
+    events = VERSION_MODERN
+    events += channel_block(0, event(flp.EVENT_SAMPLE_PATH, "C:\\Samples\\kick.wav\0".encode("utf-16-le")))
+    events += channel_block(1, plugin_tuple("FLEX", rename="Bass"))
+    events += channel_block(
+        2, plugin_tuple("Fruity Wrapper", state=vst_state("Serum", "Xfer Records", "C:\\VST\\Serum_x64.dll"))
+    )
+    kick, bass, serum = flp.read(write_flp(tmp_path, events, n_channels=3)).channels
+    assert (kick.sample_path, kick.plugin) == ("C:\\Samples\\kick.wav", None)
+    assert bass.plugin == flp.FlpPlugin("FLEX", name="Bass") and bass.name == "Bass"
+    assert serum.plugin is not None and serum.plugin.is_wrapper
+    assert serum.plugin.vst == flp.FlpVst("Serum", "Xfer Records", "C:\\VST\\Serum_x64.dll")
+
+
+def test_vst_state_with_an_overrunning_record_keeps_what_it_read():
+    state = vst_state("Serum") + struct.pack("<IQ", 56, 1 << 40)
+    assert flp.plugins.vst_identity(state) == flp.FlpVst("Serum")
+    assert flp.plugins.vst_identity(b"\x01\0\0\0") is None
+
+
+def test_mixer_slots_are_closed_by_their_index_event(tmp_path):
+    # The plugin tuple PRECEDES the 98 that closes its slot; the n-th 236 opens insert n.
+    master = event(flp.EVENT_MIXER_FLAGS, struct.pack("<III", 5, 12, 0))
+    master += event(98, b"\0\0") + plugin_tuple("Fruity Limiter", slot=1) + event(98, b"\1\0")
+    insert_one = event(flp.EVENT_MIXER_FLAGS, struct.pack("<III", 5, 12, 0))
+    insert_one += plugin_tuple("Fruity Reeverb 2", insert=1) + event(98, b"\0\0") + event(98, b"\1\0")
+    project = flp.read(write_flp(tmp_path, VERSION_MODERN + master + insert_one))
+    assert [(e.insert, e.slot, e.plugin.internal_name) for e in project.mixer] == [
+        (0, 1, "Fruity Limiter"), (1, 0, "Fruity Reeverb 2"),
+    ]
+    assert project.empty_slots(0) == [0] and project.empty_slots(1) == [1]
+
+
+def test_zero_ppq_is_an_flp_error(tmp_path):
+    with pytest.raises(FlpError, match="PPQ 0"):
+        flp.read(write_flp(tmp_path, VERSION_MODERN, ppq=0))
+
+
+def test_trial_saved_is_unlicensed_with_scrambled_slot_indexes(tmp_path):
+    # Why: a trial FL cannot reopen a project a trial saved; callers must refuse it
+    # instead of opening an empty project behind FL's Buy dialog.
+    def project(licensed: bytes, slots: list[int]) -> Path:
+        events = VERSION_MODERN + event(flp.EVENT_LICENSED, licensed)
+        events += event(flp.EVENT_MIXER_FLAGS, b"\0" * 12)
+        events += b"".join(event(98, struct.pack("<H", value)) for value in slots)
+        return write_flp(tmp_path, events)
+
+    assert flp.read(project(b"\0", [1025, 511, 65273, 64507])).trial_saved
+    assert not flp.read(project(b"\0", list(range(10)))).trial_saved  # old unlicensed demos open fine
+    assert not flp.read(project(b"\1", [1025, 511, 65273, 64507])).trial_saved
+
+
+def test_hide_info_on_open_turns_the_panel_off_in_place(tmp_path):
+    # Why: FL opens a project's info panel over the window when event 10 is 1, and it
+    # takes the foreground until clicked; a prepared starting project turns it off.
+    path = write_flp(tmp_path, VERSION_MODERN + event(10, b"\1") + channel_block(0))
+    before = path.read_bytes()
+    assert flp.hide_info_on_open(path) is True
+    after = path.read_bytes()
+    assert len(after) == len(before) and after != before
+    assert flp.hide_info_on_open(path) is False
+    assert flp.hide_info_on_open(write_flp(tmp_path, VERSION_MODERN)) is False

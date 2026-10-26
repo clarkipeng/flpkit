@@ -1,0 +1,9 @@
+{
+  "name": "FL MCP Bridge",
+  "fl_build": "26.1.5.5384",
+  "kind": "mixer-effect",
+  "captured_on": "2026-09-01",
+  "source": "fl-studio-mcp mcp-server/tests/evidence/plugin-effect/baseline.flp, Master slot 0 (added by hand in FL 26.1.5)",
+  "sha256": "9b25b8ac0f6bb12fae1f87c14deead15e86911f10b36dbc64a3b6a7c0ede4fb1",
+  "chunk_hex": "c91c46004c0020004d004300500020004200720069006400670065000000d4340000000000000000020000000000000041010000000000000000000000000000000000003a0000006400000000000000000000009b00000000805c656a002900"
+}
